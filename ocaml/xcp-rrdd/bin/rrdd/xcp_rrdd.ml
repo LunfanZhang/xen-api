@@ -359,26 +359,39 @@ let dss_loadavg () =
     )
   ]
 
+let rec sum acc n f =
+  match n with n when n >= 0 -> sum (acc + f n) (n - 1) f | _ -> acc
+
+let count_vcpus pred domains xc =
+  List.fold_left
+    (fun acc (dom, _, domid) ->
+      sum acc dom.Xenctrl.max_vcpu_id (fun id ->
+          let vcpuinfo = Xenctrl.domain_get_vcpuinfo xc domid id in
+          if pred vcpuinfo then
+            1
+          else
+            0
+      )
+    )
+    0 domains
+
+let count_running_domain domains =
+  List.fold_left
+    (fun count (dom, _, _) -> if dom.Xenctrl.running then count + 1 else count)
+    0 domains
+
 let dss_hostload xc domains =
   let physinfo = Xenctrl.physinfo xc in
   let pcpus = physinfo.Xenctrl.nr_cpus in
-  let rec sum acc n f =
-    match n with n when n >= 0 -> sum (acc + f n) (n - 1) f | _ -> acc
-  in
+
   let load =
-    List.fold_left
-      (fun acc (dom, _, domid) ->
-        sum 0 dom.Xenctrl.max_vcpu_id (fun id ->
-            let vcpuinfo = Xenctrl.domain_get_vcpuinfo xc domid id in
-            if vcpuinfo.Xenctrl.online && not vcpuinfo.Xenctrl.blocked then
-              1
-            else
-              0
-        )
-        + acc
-      )
-      0 domains
+    count_vcpus
+      (fun ctrl -> ctrl.Xenctrl.online && not ctrl.Xenctrl.blocked)
+      domains xc
   in
+
+  let running_domains = count_running_domain domains in
+
   let load_per_cpu = float_of_int load /. float_of_int pcpus in
   [
     ( Rrd.Host
@@ -389,6 +402,18 @@ let dss_hostload xc domains =
           )
         ~value:(Rrd.VT_Float load_per_cpu) ~min:0.0 ~ty:Rrd.Gauge ~default:true
         ()
+    )
+  ; ( Rrd.Host
+    , Ds.ds_make ~name:"running_vcpus" ~units:"(integer)"
+        ~description:"The total number of running vCPU per host"
+        ~value:(Rrd.VT_Int64 (Int64.of_int load))
+        ~min:0.0 ~ty:Rrd.Gauge ~default:true ()
+    )
+  ; ( Rrd.Host
+    , Ds.ds_make ~name:"running_domains" ~units:"(integer)"
+        ~description:"The total number of running domain per host"
+        ~value:(Rrd.VT_Int64 (Int64.of_int running_domains))
+        ~min:0.0 ~ty:Rrd.Gauge ~default:true ()
     )
   ]
 
