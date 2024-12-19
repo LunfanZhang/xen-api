@@ -1998,6 +1998,14 @@ let _ =
 
   error Api_errors.too_many_groups [] ~doc:"VM can only belong to one group." () ;
 
+  error Api_errors.get_ssh_status_failed [] ~doc:"Failed to get SSH status." () ;
+
+  error Api_errors.set_idle_seesion_timeout_failed ["timeout"]
+    ~doc:"Failed to set idle session timeout." () ;
+
+  error Api_errors.set_temporary_ssh_duration_failed ["duration"]
+    ~doc:"Failed to set temporary SSH duration." () ;
+
   message
     (fst Api_messages.ha_pool_overcommitted)
     ~doc:

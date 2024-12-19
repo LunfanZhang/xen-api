@@ -1059,6 +1059,24 @@ let rec cmdtable_data : (string * cmd_spec) list =
       ; flags= [Neverforward]
       }
     )
+  ; ( "host-ssh-status-list"
+    , {
+        reqd= []
+      ; optn= []
+      ; help= "List the status of the SSH service on all hosts in the pool."
+      ; implementation= No_fd Cli_operations.host_ssh_status_list
+      ; flags= []
+      }
+    )
+  ; ( "host-set-idle-session-timeout"
+    , {
+        reqd= ["timeout"]
+      ; optn= []
+      ; help= "Set the idle session timeout for the host."
+      ; implementation= No_fd Cli_operations.host_set_idle_session_timeout
+      ; flags= []
+      }
+    )
   ; ( "patch-upload"
     , {
         reqd= ["file-name"]

@@ -2329,6 +2329,39 @@ let emergency_clear_mandatory_guidance =
     ~doc:"Clear the pending mandatory guidance on this host"
     ~allowed_roles:_R_LOCAL_ROOT_ONLY ()
 
+let list_ssh_status =
+  call ~name:"list_ssh_status"
+    ~lifecycle:[]
+    ~doc:"List the status of the SSH service status, SSH setting and remain SSH expire time on the host"
+    ~params:[(Ref _host, "host", "The host")]
+    ~result:
+      (Set String, "status of the SSH service status, SSH setting and remain SSH expire time")
+    ~allowed_roles:_R_POOL_OP ()
+
+let set_idle_session_timeout =
+  call ~name:"set_idle_session_timeout"
+    ~lifecycle:[]
+    ~doc:"Set the idle session timeout for the host"
+    ~params:
+      [
+        (Ref _host, "host", "The host")
+      ; (Int, "timeout", "The idle session timeout in seconds")
+      ]
+    ~allowed_roles:R_POOL_ADMIN ()
+
+(*   
+let set_temporary_ssh_enable_duration =
+  call ~name:"set_temporary_ssh_enable_duration"
+    ~lifecycle:[]
+    ~doc:"Set the temporary SSH enable duration for the host"
+    ~params:
+      [
+        (Ref _host, "host", "The host")
+      ; (Int, "duration", "The temporary SSH enable duration in minutes")
+      ]
+    ~allowed_roles:R_POOL_ADMIN ()
+*) 
+
 let latest_synced_updates_applied_state =
   Enum
     ( "latest_synced_updates_applied_state"
@@ -2485,6 +2518,9 @@ let t =
       ; set_https_only
       ; apply_recommended_guidances
       ; emergency_clear_mandatory_guidance
+      ; list_ssh_status
+      ; set_idle_session_timeout
+(*      ; set_temporary_ssh_enable_duration *)
       ]
     ~contents:
       ([

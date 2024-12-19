@@ -3052,3 +3052,83 @@ let emergency_clear_mandatory_guidance ~__context =
          info "%s: %s is cleared" __FUNCTION__ s
      ) ;
   Db.Host.set_pending_guidances ~__context ~self ~value:[]
+
+let list_ssh_status ~__context =
+  let ssh_execution_time_file = "/etc/ssh/ssh_execution_time" in
+  let ssh_mode_file = "/etc/ssh/ssh_mode" in
+
+  let read_file file =
+    try Some (Unixext.string_of_file file) with _ -> None
+  in
+
+  let get_remain_expire_time () =
+    match read_file ssh_execution_time_file with
+    | None -> None
+    | Some content ->
+        let expire_time = Int64.of_string content in
+        let current_time = Int64.of_float (Unix.gettimeofday ()) in
+        if expire_time > current_time then
+          Some (Int64.sub expire_time current_time)
+        else
+          None
+  in
+
+  let get_ssh_setting () =
+    match read_file ssh_mode_file with
+    | None -> "on"
+    | Some setting -> String.trim setting
+  in
+
+  let get_ssh_status () =
+    let status = Xapi_systemctl.status "sshd" in
+    match status with
+    | `active -> "on"
+    | `inactive -> "off"
+    | _ -> "unknown"
+  in
+
+  let remain_expire_time = get_remain_expire_time () in
+  let ssh_setting = get_ssh_setting () in
+  let ssh_status =
+    match remain_expire_time with
+    | Some _ when get_ssh_status () = "on" -> "on (temporary)"
+    | _ -> get_ssh_status ()
+  in
+
+  (ssh_status, ssh_setting, remain_expire_time)
+
+let set_idle_session_timeout ~__context ~timeout =
+  let sshd_config_file = "/etc/ssh/sshd_config" in
+  let param = "ClientAliveInterval" in
+  let new_config = Printf.sprintf "%s %d" param timeout in
+
+  (* Update the sshd_config file *)
+  let update_sshd_config () =
+    let lines = ref [] in
+    let ic = open_in sshd_config_file in
+    try
+      while true do
+        let line = input_line ic in
+        if String.starts_with ~prefix:param line then
+          lines := new_config :: !lines
+        else
+          lines := line :: !lines
+      done
+    with End_of_file ->
+      close_in ic ;
+      let oc = open_out sshd_config_file in
+      List.iter (fun line -> Printf.fprintf oc "%s\n" line) (List.rev !lines) ;
+      close_out oc
+  in
+
+  (* Restart the SSH service if it is active *)
+  let restart_ssh_service () =
+    match Xapi_systemctl.status "sshd" with
+    | `active ->
+        Xapi_systemctl.restart "sshd"
+    | _ ->
+        ()
+  in
+
+  update_sshd_config () ;
+  restart_ssh_service ()

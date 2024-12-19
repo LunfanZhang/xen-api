@@ -66,3 +66,16 @@ let stop ?(timeout = 5.) ~wait_until_success service =
 
 let start ?(timeout = 5.) ~wait_until_success service =
   perform ~wait_until_success ~service ~timeout Start
+
+let status ~service =
+  try
+    debug "status %s" service ;
+    let output =
+      Forkhelpers.execute_command_get_output !Xapi_globs.systemctl ["is-active"; service]
+    in
+    debug "Status of %s: %s" service output ;
+    output
+  with e ->
+    let err_str = ExnHelper.string_of_exn e in
+    error "Fail to get status of %s with error %s" service err_str ;
+    raise (Systemctl_fail err_str)

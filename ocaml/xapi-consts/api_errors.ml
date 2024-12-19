@@ -1398,3 +1398,9 @@ let telemetry_next_collection_too_late =
 let illegal_in_fips_mode = add_error "ILLEGAL_IN_FIPS_MODE"
 
 let too_many_groups = add_error "TOO_MANY_GROUPS"
+
+let get_ssh_status_failed  = add_error "GET_SSH_STATUS_FAILED"
+
+let set_idle_seesion_timeout_failed = add_error "SET_IDLE_SESSION_TIMEOUT_FAILED"
+
+let set_temporary_ssh_duration_failed = add_error "SET_TEMPORARY_SSH_DURATION_FAILED"

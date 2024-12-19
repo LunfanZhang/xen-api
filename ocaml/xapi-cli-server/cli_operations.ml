@@ -8025,3 +8025,25 @@ module VM_group = struct
     in
     Client.VM_group.destroy ~rpc ~session_id ~self:ref
 end
+
+module ssh = struct
+  let host_ssh_status_list printer rpc session_id _params =
+    let hosts = Client.Host.get_all ~rpc ~session_id in
+    let status_list = List.map (fun host -> Client.Host.get_ssh_status ~rpc ~session_id ~self:host) hosts in
+    let table_of_status (ssh_status, ssh_setting, remain_expire_time, host) =
+      [
+        ("host", Client.Host.get_uuid ~rpc ~session_id ~self:host);
+        ("ssh-status", ssh_status);
+        ("ssh-setting", ssh_setting);
+        ("remain-expire-time", Int64.to_string remain_expire_time);
+      ]
+    in
+    let all = List.map table_of_status status_list in
+    printer (Cli_printer.PTable all)
+
+  let host_set_idle_session_timeout printer rpc session_id params =
+    let host_uuid = List.assoc "host-uuid" params in
+    let host = Client.Host.get_by_uuid ~rpc ~session_id ~uuid:host_uuid in
+    let timeout = Int64.of_string (List.assoc "timeout" params) in
+    Client.Host.set_idle_session_timeout ~rpc ~session_id ~self:host ~timeout
+end
