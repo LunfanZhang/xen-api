@@ -3154,8 +3154,7 @@ let disable_ssh_internal ~__context ~self =
     Helpers.internal_error "Failed to disable SSH access, host: %s"
       (Ref.string_of self)
 
-let schedule_disable_ssh_job ~__context ~self ~timeout =
-  let host_uuid = Helpers.get_localhost_uuid () in
+let set_expiry ~__context ~self ~timeout =
   let expiry_time =
     match
       Ptime.add_span (Ptime_clock.now ())
@@ -3172,6 +3171,10 @@ let schedule_disable_ssh_job ~__context ~self ~timeout =
     | Some t ->
         Ptime.to_float_s t |> Date.of_unix_time
   in
+  Db.Host.set_ssh_expiry ~__context ~self ~value:expiry_time
+
+let schedule_disable_ssh_job ~__context ~self ~timeout =
+  let host_uuid = Helpers.get_localhost_uuid () in
 
   debug "Scheduling SSH disable job for host %s with timeout %Ld seconds"
     host_uuid timeout ;
@@ -3184,9 +3187,7 @@ let schedule_disable_ssh_job ~__context ~self ~timeout =
     !Xapi_globs.job_for_disable_ssh
     Xapi_stdext_threads_scheduler.Scheduler.OneShot (Int64.to_float timeout)
     (fun () -> disable_ssh_internal ~__context ~self
-  ) ;
-
-  Db.Host.set_ssh_expiry ~__context ~self ~value:expiry_time
+  )
 
 let enable_ssh ~__context ~self =
   try
@@ -3202,6 +3203,7 @@ let enable_ssh ~__context ~self =
           !Xapi_globs.job_for_disable_ssh ;
         Db.Host.set_ssh_expiry ~__context ~self ~value:Date.epoch
     | t ->
+        set_expiry ~__context ~self ~timeout:t ;
         schedule_disable_ssh_job ~__context ~self ~timeout:t
     ) ;
 
@@ -3241,6 +3243,7 @@ let set_ssh_enabled_timeout ~__context ~self ~value =
           !Xapi_globs.job_for_disable_ssh ;
         Db.Host.set_ssh_expiry ~__context ~self ~value:Date.epoch
     | t ->
+        set_expiry ~__context ~self ~timeout:t ;
         schedule_disable_ssh_job ~__context ~self ~timeout:t
 
 let set_console_idle_timeout ~__context ~self ~value =
