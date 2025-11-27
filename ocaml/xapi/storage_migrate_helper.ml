@@ -314,6 +314,29 @@ module State = struct
           (Sr.of_string sr, Vdi.of_string (String.concat "/" rest))
     | _ ->
         failwith "Bad id"
+
+  (* Snapshot mappings storage for SMAPIv3 migrations.
+     Maps mirror_id -> list of (source_snapshot_vdi, dest_snapshot_vdi) pairs.
+     This allows snapshot VMs' VBDs to be correctly updated after mirroring. *)
+  type snapshot_mappings_table =
+    (string, (Storage_interface.Vdi.t * Storage_interface.Vdi.t) list) Hashtbl.t
+
+  let snapshot_mappings : snapshot_mappings_table = Hashtbl.create 10
+
+  let set_snapshot_mappings mirror_id mappings =
+    Xapi_stdext_threads.Threadext.Mutex.execute mutex (fun () ->
+        Hashtbl.replace snapshot_mappings mirror_id mappings
+    )
+
+  let get_snapshot_mappings mirror_id =
+    Xapi_stdext_threads.Threadext.Mutex.execute mutex (fun () ->
+        Hashtbl.find_opt snapshot_mappings mirror_id |> Option.value ~default:[]
+    )
+
+  let remove_snapshot_mappings mirror_id =
+    Xapi_stdext_threads.Threadext.Mutex.execute mutex (fun () ->
+        Hashtbl.remove snapshot_mappings mirror_id
+    )
 end
 
 let vdi_info = function
