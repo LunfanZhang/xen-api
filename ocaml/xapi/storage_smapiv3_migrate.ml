@@ -150,19 +150,6 @@ let mirror_snapshot_into_existing_dest ~dbg ~sr ~snapshot_vdi_uuid ~dest_sr
     D.info "%s Destination snapshot created (existing dest): %s" __FUNCTION__
       (s_of_vdi dest_snapshot.vdi) ;
 
-    (* Store the snapshot mapping in the dest leaf VDI's sm_config so it can be
-       retrieved later for VDI mapping. This allows snapshot VMs' VBDs to be
-       correctly updated to point to the destination snapshot VDI. *)
-    let snapshot_mapping_key =
-      Printf.sprintf "snapshot_mapping_%s" snapshot_vdi_uuid
-    in
-    let snapshot_mapping_value = s_of_vdi dest_snapshot.vdi in
-    Remote.VDI.add_to_sm_config dbg dest_sr dest_vdi_info.vdi
-      snapshot_mapping_key snapshot_mapping_value ;
-    SXM.info
-      "%s Stored snapshot mapping in leaf VDI sm_config: %s → %s"
-      __FUNCTION__ snapshot_vdi_uuid snapshot_mapping_value ;
-
     dest_snapshot
   with e ->
     D.error
@@ -297,6 +284,9 @@ module MIRROR : SMAPIv2_MIRROR = struct
        This means that if the VM shutsdown while SXM is in progress the
        mirroring for SMAPIv3 will fail.*)
     
+    (* Track snapshot mappings created during mirroring *)
+    let snapshot_mappings = ref [] in
+    
     (* Get and log the snapshot chain for migration planning *)
     let snapshot_chain = get_snapshot_chain ~dbg ~sr ~vdi in
 
@@ -307,8 +297,7 @@ module MIRROR : SMAPIv2_MIRROR = struct
           D.info "%s No snapshots found, will mirror leaf VDI only" __FUNCTION__ ;
           None
       | base_snapshot_uuid :: _rest ->
-          SXM.info "%s Found %d snapshots, starting with base snapshot: %s"
-            __FUNCTION__ (List.length snapshot_chain) base_snapshot_uuid ;
+          D.info "%s Base snapshot found: %s" __FUNCTION__ base_snapshot_uuid ;
           Some base_snapshot_uuid
     in
     match remote_mirror with
@@ -367,6 +356,12 @@ module MIRROR : SMAPIv2_MIRROR = struct
             SXM.info "%s Snapshot mirror complete, snapshot created: %s"
               __FUNCTION__ (s_of_vdi dest_snapshot.vdi) ;
             
+            (* Record the snapshot mapping for return *)
+            let src_snapshot_vdi = Vdi.of_string base_snapshot_uuid in
+            snapshot_mappings := (src_snapshot_vdi, dest_snapshot.vdi) :: !snapshot_mappings ;
+            D.info "%s Recorded snapshot mapping: %s → %s" __FUNCTION__
+              base_snapshot_uuid (s_of_vdi dest_snapshot.vdi) ;
+            
             (* The NBD proxy thread for snapshot mirror has now finished.
                Deactivate and reactivate as writable for leaf mirror. *)
             let (module Remote) =
@@ -414,7 +409,12 @@ module MIRROR : SMAPIv2_MIRROR = struct
         State.add mirror_id (State.Send_op alm) ;
         D.debug "%s Updated mirror_id %s in the active local mirror"
           __FUNCTION__ mirror_id ;
-        mirror_wait ~dbg ~sr ~vdi ~vm:live_vm ~mirror_id mk
+        mirror_wait ~dbg ~sr ~vdi ~vm:live_vm ~mirror_id mk ;
+        
+        (* Store snapshot mappings in State for retrieval by xapi_vm_migrate *)
+        D.info "%s Storing %d snapshot mappings in State for mirror_id %s"
+          __FUNCTION__ (List.length !snapshot_mappings) mirror_id ;
+        State.set_snapshot_mappings mirror_id !snapshot_mappings
       with e ->
         D.error "%s caught exception during mirror: %s" __FUNCTION__
           (Printexc.to_string e) ;

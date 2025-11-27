@@ -1125,84 +1125,67 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
             let mirror_record =
               get_mirror_record ~new_dp remote_vdi remote_vdi_ref
             in
-            (* For SMAPIv3 mirroring, extract snapshot mappings from dest VDI's sm_config
-               and create additional mirror records for snapshot VDIs *)
-            let snapshot_mirror_records =
-              if
-                vconf.do_mirror
-                && Storage_mux_reg.smapi_version_of_sr vconf.sr = SMAPIv3
-              then (
-                debug
-                  "Extracting snapshot mappings from dest VDI sm_config for \
-                   SMAPIv3 migration" ;
-                try
-                  let dest_vdi_info =
-                    XenAPI.VDI.get_record ~rpc:remote.rpc
-                      ~session_id:remote.session ~self:remote_vdi_ref
+            (* Retrieve snapshot mappings from State (for SMAPIv3 migrations) *)
+            let snapshot_mappings =
+              match mirror_id with
+              | Some mid ->
+                  let mappings =
+                    Storage_migrate_helper.State.get_snapshot_mappings mid
                   in
-                  (* Find all sm_config entries with key starting with "snapshot_mapping_" *)
-                  List.filter_map
-                    (fun (key, value) ->
-                      if Astring.String.is_prefix ~affix:"snapshot_mapping_" key
-                      then (
-                        (* Extract source snapshot UUID from key *)
-                        let src_snapshot_uuid =
-                          Astring.String.with_range ~first:17 key
-                        in
-                        let dest_snapshot_uuid = value in
-                        debug
-                          "Found snapshot mapping: %s → %s" src_snapshot_uuid
-                          dest_snapshot_uuid ;
-                        try
-                          (* Get source snapshot VDI reference from local database *)
-                          let src_snapshot_ref =
-                            Db.VDI.get_by_uuid ~__context ~uuid:src_snapshot_uuid
-                          in
-                          (* Get dest snapshot VDI reference from remote *)
-                          let dest_snapshot_ref =
-                            XenAPI.VDI.get_by_uuid ~rpc:remote.rpc
-                              ~session_id:remote.session ~uuid:dest_snapshot_uuid
-                          in
-                          Some
-                            {
-                              mr_dp= None
-                            ; mr_mirrored= false
-                            ; mr_local_sr= vconf.sr
-                            ; mr_local_vdi=
-                                Storage_interface.Vdi.of_string src_snapshot_uuid
-                            ; mr_remote_sr= dest_sr
-                            ; mr_remote_vdi=
-                                Storage_interface.Vdi.of_string dest_snapshot_uuid
-                            ; mr_local_xenops_locator=
-                                Xapi_xenops.xenops_vdi_locator ~__context
-                                  ~self:src_snapshot_ref
-                            ; mr_remote_xenops_locator=
-                                Xapi_xenops.xenops_vdi_locator_of dest_sr
-                                  (Storage_interface.Vdi.of_string
-                                     dest_snapshot_uuid
-                                  )
-                            ; mr_local_vdi_reference= src_snapshot_ref
-                            ; mr_remote_vdi_reference= dest_snapshot_ref
-                            }
-                        with e ->
-                          warn
-                            "Failed to create mirror record for snapshot %s → \
-                             %s: %s"
-                            src_snapshot_uuid dest_snapshot_uuid
-                            (Printexc.to_string e) ;
-                          None
-                      ) else
-                        None
-                    )
-                    dest_vdi_info.API.vDI_sm_config
-                with e ->
-                  warn
-                    "Failed to extract snapshot mappings from dest VDI \
-                     sm_config: %s"
-                    (Printexc.to_string e) ;
+                  if mappings <> [] then
+                    debug "Retrieved %d snapshot mappings from State for mirror %s"
+                      (List.length mappings) mid ;
+                  mappings
+              | None ->
                   []
-              ) else
-                []
+            in
+            (* Create mirror records for snapshot VDIs *)
+            let snapshot_mirror_records =
+              List.filter_map
+                (fun (src_snapshot_vdi, dest_snapshot_vdi) ->
+                  let src_snapshot_uuid =
+                    Storage_interface.Vdi.string_of src_snapshot_vdi
+                  in
+                  let dest_snapshot_uuid =
+                    Storage_interface.Vdi.string_of dest_snapshot_vdi
+                  in
+                  debug "Processing snapshot mapping: %s → %s" src_snapshot_uuid
+                    dest_snapshot_uuid ;
+                  try
+                    (* Get source snapshot VDI reference from local database *)
+                    let src_snapshot_ref =
+                      Db.VDI.get_by_uuid ~__context ~uuid:src_snapshot_uuid
+                    in
+                    (* Get dest snapshot VDI reference from remote *)
+                    let dest_snapshot_ref =
+                      XenAPI.VDI.get_by_uuid ~rpc:remote.rpc
+                        ~session_id:remote.session ~uuid:dest_snapshot_uuid
+                    in
+                    Some
+                      {
+                        mr_dp= None
+                      ; mr_mirrored= false
+                      ; mr_local_sr= vconf.sr
+                      ; mr_local_vdi= src_snapshot_vdi
+                      ; mr_remote_sr= dest_sr
+                      ; mr_remote_vdi= dest_snapshot_vdi
+                      ; mr_local_xenops_locator=
+                          Xapi_xenops.xenops_vdi_locator ~__context
+                            ~self:src_snapshot_ref
+                      ; mr_remote_xenops_locator=
+                          Xapi_xenops.xenops_vdi_locator_of dest_sr
+                            dest_snapshot_vdi
+                      ; mr_local_vdi_reference= src_snapshot_ref
+                      ; mr_remote_vdi_reference= dest_snapshot_ref
+                      }
+                  with e ->
+                    warn
+                      "Failed to create mirror record for snapshot %s → %s: %s"
+                      src_snapshot_uuid dest_snapshot_uuid
+                      (Printexc.to_string e) ;
+                    None
+                )
+                snapshot_mappings
             in
             (* Process all mirror records - leaf and snapshots *)
             let result = post_mirror mirror_id mirror_record in
@@ -1210,6 +1193,9 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
             List.iter
               (fun snap_mr -> ignore (continuation snap_mr))
               snapshot_mirror_records ;
+            (* Clean up snapshot mappings from State after use *)
+            Option.iter Storage_migrate_helper.State.remove_snapshot_mappings
+              mirror_id ;
             result
         )
     )
