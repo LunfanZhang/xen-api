@@ -290,16 +290,19 @@ module MIRROR : SMAPIv2_MIRROR = struct
     (* Get and log the snapshot chain for migration planning *)
     let snapshot_chain = get_snapshot_chain ~dbg ~sr ~vdi in
 
-    (* Determine the first (oldest/base) snapshot, if it exists *)
-    let base_snapshot_opt =
-      match snapshot_chain with
-      | [] ->
-          D.info "%s No snapshots found, will mirror leaf VDI only" __FUNCTION__ ;
-          None
-      | base_snapshot_uuid :: _rest ->
-          D.info "%s Base snapshot found: %s" __FUNCTION__ base_snapshot_uuid ;
-          Some base_snapshot_uuid
-    in
+    (* Log snapshot chain status *)
+    ( match snapshot_chain with
+    | [] ->
+        D.info "%s No snapshots found, will mirror leaf VDI only" __FUNCTION__
+    | snapshots ->
+        SXM.info "%s Found %d snapshots to mirror (base to leaf order):"
+          __FUNCTION__ (List.length snapshots) ;
+        List.iteri
+          (fun idx uuid ->
+            SXM.info "%s   Snapshot[%d]: %s" __FUNCTION__ idx uuid
+          )
+          snapshots
+    ) ;
     match remote_mirror with
     | Mirror.Vhd_mirror _ ->
         raise
@@ -319,55 +322,75 @@ module MIRROR : SMAPIv2_MIRROR = struct
             ()
           |> Uri.to_string
         in
-        (* If there is a base snapshot, mirror it into the existing mirror_vdi
-           (which is currently activated readonly from receive_start3), then
-           snapshot it and reactivate as writable for the leaf mirror. *)
-        ( match base_snapshot_opt with
-        | None ->
-            (* No snapshot: deactivate readonly and reactivate as writable *)
+        (* Mirror all snapshots in the chain (base to leaf order).
+           Each snapshot is mirrored into mirror_vdi, then snapshotted to create
+           the corresponding destination snapshot. This builds up the snapshot
+           chain incrementally on the destination. *)
+        ( match snapshot_chain with
+        | [] ->
+            (* No snapshots: deactivate readonly and reactivate as writable *)
             let (module Remote) =
               Storage_migrate_helper.get_remote_backend url verify_dest
             in
-            SXM.info "%s No snapshot, switching mirror_vdi %s from readonly to writable"
+            SXM.info "%s No snapshots, switching mirror_vdi %s from readonly to writable"
               __FUNCTION__ (s_of_vdi mirror_vdi.vdi) ;
             Remote.VDI.deactivate dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm ;
             Remote.VDI.activate3 dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm
-        | Some base_snapshot_uuid ->
-            (* Start NBD proxy for snapshot mirror *)
-            SXM.info "%s Starting NBD proxy for snapshot mirror" __FUNCTION__ ;
-            let _ : Thread.t =
-              Thread.create
-                (fun () ->
-                  export_nbd_proxy ~remote_url:url ~mirror_vm ~sr:dest_sr
-                    ~vdi:mirror_vdi.vdi ~dp:mirror_datapath ~verify_dest
-                )
-                ()
-            in
+        | snapshots ->
+            (* Mirror each snapshot in base-to-leaf order.
+               Each snapshot gets a fresh NBD proxy to avoid stale connections. *)
+            List.iteri
+              (fun idx snapshot_uuid ->
+                SXM.info
+                  "%s [%d/%d] Starting NBD proxy for snapshot %s mirror"
+                  __FUNCTION__ (idx + 1) (List.length snapshots) snapshot_uuid ;
+                (* Start a fresh NBD proxy for this snapshot *)
+                let _ : Thread.t =
+                  Thread.create
+                    (fun () ->
+                      export_nbd_proxy ~remote_url:url ~mirror_vm ~sr:dest_sr
+                        ~vdi:mirror_vdi.vdi ~dp:mirror_datapath ~verify_dest
+                    )
+                    ()
+                in
+                (* Give NBD proxy time to start *)
+                Unix.sleepf 0.5 ;
+                
+                SXM.info
+                  "%s [%d/%d] Mirroring snapshot %s into mirror_vdi %s (readonly)"
+                  __FUNCTION__ (idx + 1) (List.length snapshots) snapshot_uuid
+                  (s_of_vdi mirror_vdi.vdi) ;
+                let dest_snapshot =
+                  mirror_snapshot_into_existing_dest ~dbg ~sr
+                    ~snapshot_vdi_uuid:snapshot_uuid ~dest_sr ~dest_url:url
+                    ~verify_dest ~mirror_vm ~copy_vm ~dest_vdi_info:mirror_vdi
+                    ~nbd_uri
+                in
+                SXM.info
+                  "%s [%d/%d] Snapshot mirror complete, created: %s" __FUNCTION__
+                  (idx + 1) (List.length snapshots)
+                  (s_of_vdi dest_snapshot.vdi) ;
+                
+                (* Record the snapshot mapping (append to maintain base-to-leaf order) *)
+                let src_snapshot_vdi = Vdi.of_string snapshot_uuid in
+                snapshot_mappings :=
+                  !snapshot_mappings @ [(src_snapshot_vdi, dest_snapshot.vdi)] ;
+                D.info "%s Recorded snapshot mapping: %s → %s" __FUNCTION__
+                  snapshot_uuid (s_of_vdi dest_snapshot.vdi) ;
+                
+                (* Note: NBD proxy thread will exit automatically when the mirror completes *)
+              )
+              snapshots ;
             
-            SXM.info
-              "%s Mirroring base snapshot %s into existing mirror_vdi %s (readonly)"
-              __FUNCTION__ base_snapshot_uuid (s_of_vdi mirror_vdi.vdi) ;
-            let dest_snapshot =
-              mirror_snapshot_into_existing_dest ~dbg ~sr
-                ~snapshot_vdi_uuid:base_snapshot_uuid ~dest_sr
-                ~dest_url:url ~verify_dest ~mirror_vm ~copy_vm
-                ~dest_vdi_info:mirror_vdi ~nbd_uri
-            in
-            SXM.info "%s Snapshot mirror complete, snapshot created: %s"
-              __FUNCTION__ (s_of_vdi dest_snapshot.vdi) ;
+            SXM.info "%s All %d snapshot(s) mirrored successfully" __FUNCTION__
+              (List.length snapshots) ;
             
-            (* Record the snapshot mapping for return *)
-            let src_snapshot_vdi = Vdi.of_string base_snapshot_uuid in
-            snapshot_mappings := (src_snapshot_vdi, dest_snapshot.vdi) :: !snapshot_mappings ;
-            D.info "%s Recorded snapshot mapping: %s → %s" __FUNCTION__
-              base_snapshot_uuid (s_of_vdi dest_snapshot.vdi) ;
-            
-            (* The NBD proxy thread for snapshot mirror has now finished.
-               Deactivate and reactivate as writable for leaf mirror. *)
+            (* After all snapshots are mirrored, deactivate readonly and
+               reactivate as writable for the leaf mirror. *)
             let (module Remote) =
               Storage_migrate_helper.get_remote_backend url verify_dest
             in
-            SXM.info "%s Switching mirror_vdi %s from readonly to writable"
+            SXM.info "%s Switching mirror_vdi %s from readonly to writable for leaf mirror"
               __FUNCTION__ (s_of_vdi mirror_vdi.vdi) ;
             Remote.VDI.deactivate dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm ;
             Remote.VDI.activate3 dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm
@@ -412,8 +435,16 @@ module MIRROR : SMAPIv2_MIRROR = struct
         mirror_wait ~dbg ~sr ~vdi ~vm:live_vm ~mirror_id mk ;
         
         (* Store snapshot mappings in State for retrieval by xapi_vm_migrate *)
-        D.info "%s Storing %d snapshot mappings in State for mirror_id %s"
+        SXM.info
+          "%s Migration complete. Storing %d snapshot mapping(s) in State for \
+           mirror_id %s"
           __FUNCTION__ (List.length !snapshot_mappings) mirror_id ;
+        List.iteri
+          (fun idx (src, dest) ->
+            SXM.info "%s   Mapping[%d]: %s → %s" __FUNCTION__ idx
+              (s_of_vdi src) (s_of_vdi dest)
+          )
+          !snapshot_mappings ;
         State.set_snapshot_mappings mirror_id !snapshot_mappings
       with e ->
         D.error "%s caught exception during mirror: %s" __FUNCTION__
