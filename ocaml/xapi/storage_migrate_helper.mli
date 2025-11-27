@@ -236,6 +236,19 @@ module State : sig
   val copy_id_of : Storage_interface.sr * Storage_interface.vdi -> string
 
   val of_copy_id : string -> Storage_interface.sr * Storage_interface.vdi
+
+  type snapshot_mappings_table =
+    (string, (Storage_interface.Vdi.t * Storage_interface.Vdi.t) list) Hashtbl.t
+
+  val snapshot_mappings : snapshot_mappings_table
+
+  val set_snapshot_mappings :
+    string -> (Storage_interface.Vdi.t * Storage_interface.Vdi.t) list -> unit
+
+  val get_snapshot_mappings :
+    string -> (Storage_interface.Vdi.t * Storage_interface.Vdi.t) list
+
+  val remove_snapshot_mappings : string -> unit
 end
 
 val vdi_info :
