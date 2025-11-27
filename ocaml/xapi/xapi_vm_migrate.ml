@@ -1125,7 +1125,92 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
             let mirror_record =
               get_mirror_record ~new_dp remote_vdi remote_vdi_ref
             in
-            post_mirror mirror_id mirror_record
+            (* For SMAPIv3 mirroring, extract snapshot mappings from dest VDI's sm_config
+               and create additional mirror records for snapshot VDIs *)
+            let snapshot_mirror_records =
+              if
+                vconf.do_mirror
+                && Storage_mux_reg.smapi_version_of_sr vconf.sr = SMAPIv3
+              then (
+                debug
+                  "Extracting snapshot mappings from dest VDI sm_config for \
+                   SMAPIv3 migration" ;
+                try
+                  let dest_vdi_info =
+                    XenAPI.VDI.get_record ~rpc:remote.rpc
+                      ~session_id:remote.session ~self:remote_vdi_ref
+                  in
+                  (* Find all sm_config entries with key starting with "snapshot_mapping_" *)
+                  List.filter_map
+                    (fun (key, value) ->
+                      if Astring.String.is_prefix ~affix:"snapshot_mapping_" key
+                      then (
+                        (* Extract source snapshot UUID from key *)
+                        let src_snapshot_uuid =
+                          Astring.String.with_range ~first:17 key
+                        in
+                        let dest_snapshot_uuid = value in
+                        debug
+                          "Found snapshot mapping: %s → %s" src_snapshot_uuid
+                          dest_snapshot_uuid ;
+                        try
+                          (* Get source snapshot VDI reference from local database *)
+                          let src_snapshot_ref =
+                            Db.VDI.get_by_uuid ~__context ~uuid:src_snapshot_uuid
+                          in
+                          (* Get dest snapshot VDI reference from remote *)
+                          let dest_snapshot_ref =
+                            XenAPI.VDI.get_by_uuid ~rpc:remote.rpc
+                              ~session_id:remote.session ~uuid:dest_snapshot_uuid
+                          in
+                          Some
+                            {
+                              mr_dp= None
+                            ; mr_mirrored= false
+                            ; mr_local_sr= vconf.sr
+                            ; mr_local_vdi=
+                                Storage_interface.Vdi.of_string src_snapshot_uuid
+                            ; mr_remote_sr= dest_sr
+                            ; mr_remote_vdi=
+                                Storage_interface.Vdi.of_string dest_snapshot_uuid
+                            ; mr_local_xenops_locator=
+                                Xapi_xenops.xenops_vdi_locator ~__context
+                                  ~self:src_snapshot_ref
+                            ; mr_remote_xenops_locator=
+                                Xapi_xenops.xenops_vdi_locator_of dest_sr
+                                  (Storage_interface.Vdi.of_string
+                                     dest_snapshot_uuid
+                                  )
+                            ; mr_local_vdi_reference= src_snapshot_ref
+                            ; mr_remote_vdi_reference= dest_snapshot_ref
+                            }
+                        with e ->
+                          warn
+                            "Failed to create mirror record for snapshot %s → \
+                             %s: %s"
+                            src_snapshot_uuid dest_snapshot_uuid
+                            (Printexc.to_string e) ;
+                          None
+                      ) else
+                        None
+                    )
+                    dest_vdi_info.API.vDI_sm_config
+                with e ->
+                  warn
+                    "Failed to extract snapshot mappings from dest VDI \
+                     sm_config: %s"
+                    (Printexc.to_string e) ;
+                  []
+              ) else
+                []
+            in
+            (* Process all mirror records - leaf and snapshots *)
+            let result = post_mirror mirror_id mirror_record in
+            (* Process snapshot mirror records separately if any *)
+            List.iter
+              (fun snap_mr -> ignore (continuation snap_mr))
+              snapshot_mirror_records ;
+            result
         )
     )
   else
@@ -1345,7 +1430,23 @@ let migrate_send' ~__context ~vm ~dest ~live:_ ~vdi_map ~vif_map ~vgpu_map
   (* Resolve placement of unspecified VDIs here - unspecified VDIs that
             are 'snapshot_of' a specified VDI go to the same place. suspend VDIs
             that are unspecified go to the suspend_sr_ref defined above *)
-  let extra_vdis = suspends_vdis @ snapshots_vdis in
+  (* For SMAPIv3 SRs, snapshot VDIs are already handled by mirroring via
+     mirror_snapshot_into_existing_dest in send_start. We only need to copy
+     suspend VDIs. For SMAPIv1 SRs, both need to be copied. *)
+  let extra_vdis =
+    match
+      List.exists
+        (fun vconf -> Storage_mux_reg.smapi_version_of_sr vconf.sr = SMAPIv3)
+        snapshots_vdis
+    with
+    | true ->
+        debug
+          "SMAPIv3 snapshot VDIs detected - excluding them from copy list as \
+           they are handled by mirroring" ;
+        suspends_vdis
+    | false ->
+        suspends_vdis @ snapshots_vdis
+  in
   let extra_vdi_map =
     List.map
       (fun vconf ->

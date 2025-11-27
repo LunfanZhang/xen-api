@@ -150,6 +150,19 @@ let mirror_snapshot_into_existing_dest ~dbg ~sr ~snapshot_vdi_uuid ~dest_sr
     D.info "%s Destination snapshot created (existing dest): %s" __FUNCTION__
       (s_of_vdi dest_snapshot.vdi) ;
 
+    (* Store the snapshot mapping in the dest leaf VDI's sm_config so it can be
+       retrieved later for VDI mapping. This allows snapshot VMs' VBDs to be
+       correctly updated to point to the destination snapshot VDI. *)
+    let snapshot_mapping_key =
+      Printf.sprintf "snapshot_mapping_%s" snapshot_vdi_uuid
+    in
+    let snapshot_mapping_value = s_of_vdi dest_snapshot.vdi in
+    Remote.VDI.add_to_sm_config dbg dest_sr dest_vdi_info.vdi
+      snapshot_mapping_key snapshot_mapping_value ;
+    SXM.info
+      "%s Stored snapshot mapping in leaf VDI sm_config: %s → %s"
+      __FUNCTION__ snapshot_vdi_uuid snapshot_mapping_value ;
+
     dest_snapshot
   with e ->
     D.error
