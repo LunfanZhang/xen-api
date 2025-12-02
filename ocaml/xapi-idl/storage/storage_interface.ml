@@ -732,6 +732,18 @@ module StorageAPI (R : RPC) = struct
         @-> returning unit_p err
         )
 
+    (** [set_snapshot_relations_smapiv3 sr relations] updates snapshot_of for a
+        list of destination snapshot VDIs and their leaf VDIs on a local SR.
+        This is used for SMAPIv3 migrations where snapshots are mirrored
+        directly onto the destination host. *)
+    let set_snapshot_relations_smapiv3 =
+      let relations_p =
+        Param.mk ~name:"relations"
+          TypeCombinators.(list (pair (Vdi.t, Vdi.t)))
+      in
+      declare "SR.set_snapshot_relations_smapiv3" []
+        (dbg_p @-> sr_p @-> relations_p @-> returning unit_p err)
+
     (** [update_snapshot_info_dest sr vdi dest src_vdi snapshot_pairs] updates
         the fields is_a_snapshot, snapshot_time and snapshot_of for a list of
         snapshots on a local SR. Typically, vdi will be a mirror of src_vdi,
@@ -1491,6 +1503,13 @@ module type Server_impl = sig
       -> snapshot_pairs:(vdi * vdi_info) list
       -> unit
 
+    val set_snapshot_relations_smapiv3 :
+         context
+      -> dbg:debug_info
+      -> sr:sr
+      -> relations:(vdi * vdi) list
+      -> unit
+
     val stat : context -> dbg:debug_info -> sr:sr -> sr_info
 
     val list : context -> dbg:debug_info -> sr list
@@ -1763,6 +1782,9 @@ module Server (Impl : Server_impl) () = struct
     S.SR.update_snapshot_info_dest (fun dbg sr vdi src_vdi snapshot_pairs ->
         Impl.SR.update_snapshot_info_dest () ~dbg ~sr ~vdi ~src_vdi
           ~snapshot_pairs
+    ) ;
+    S.SR.set_snapshot_relations_smapiv3 (fun dbg sr relations ->
+        Impl.SR.set_snapshot_relations_smapiv3 () ~dbg ~sr ~relations
     ) ;
     S.SR.stat (fun dbg sr -> Impl.SR.stat () ~dbg ~sr) ;
     S.SR.list (fun dbg -> Impl.SR.list () ~dbg) ;

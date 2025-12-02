@@ -1139,6 +1139,25 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
               | None ->
                   []
             in
+            let snapshot_relations =
+              List.map (fun (_src_snapshot, dest_snapshot) -> (dest_snapshot, remote_vdi)) snapshot_mappings
+            in
+            ( match snapshot_relations with
+            | [] -> ()
+            | relations ->
+                debug
+                  "Setting %d SMAPIv3 snapshot relation(s) on destination SR %s"
+                  (List.length relations)
+                  (Storage_interface.Sr.string_of dest_sr) ;
+                ( try
+                    SMAPI.SR.set_snapshot_relations_smapiv3 dbg dest_sr relations
+                  with e ->
+                    warn
+                      "Failed to set SMAPIv3 snapshot relations on dest SR %s: %s"
+                      (Storage_interface.Sr.string_of dest_sr)
+                      (Printexc.to_string e)
+                )
+            ) ;
             (* Create mirror records for snapshot VDIs *)
             let snapshot_mirror_records =
               List.filter_map
@@ -1161,23 +1180,6 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
                       XenAPI.VDI.get_by_uuid ~rpc:remote.rpc
                         ~session_id:remote.session ~uuid:dest_snapshot_uuid
                     in
-                    (* Establish snapshot_of relationship on destination:
-                       Set the snapshot VDI's snapshot_of field to point to the leaf VDI.
-                       This will automatically update the leaf VDI's snapshots field. *)
-                    ( try
-                        debug
-                          "Setting snapshot_of relationship: snapshot %s -> leaf \
-                           %s"
-                          dest_snapshot_uuid
-                          (Storage_interface.Vdi.string_of remote_vdi) ;
-                        XenAPI.VDI.set_snapshot_of ~rpc:remote.rpc
-                          ~session_id:remote.session ~self:dest_snapshot_ref
-                          ~value:remote_vdi_ref
-                      with e ->
-                        warn
-                          "Failed to set snapshot_of relationship for %s: %s"
-                          dest_snapshot_uuid (Printexc.to_string e)
-                    ) ;
                     Some
                       {
                         mr_dp= None
