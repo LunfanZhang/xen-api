@@ -316,10 +316,12 @@ module State = struct
         failwith "Bad id"
 
   (* Snapshot mappings storage for SMAPIv3 migrations.
-     Maps mirror_id -> list of (source_snapshot_vdi, dest_snapshot_vdi) pairs.
-     This allows snapshot VMs' VBDs to be correctly updated after mirroring. *)
+     Maps mirror_id -> list of (source_snapshot_vdi, dest_snapshot_vdi, snapshot_time) tuples.
+     This allows snapshot VMs' VBDs to be correctly updated and snapshot metadata preserved
+     after mirroring. The snapshot_time is in ISO8601 format. *)
   type snapshot_mappings_table =
-    (string, (Storage_interface.Vdi.t * Storage_interface.Vdi.t) list) Hashtbl.t
+    (string, (Storage_interface.Vdi.t * Storage_interface.Vdi.t * string) list)
+    Hashtbl.t
 
   let snapshot_mappings : snapshot_mappings_table = Hashtbl.create 10
 

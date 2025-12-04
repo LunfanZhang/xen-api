@@ -82,7 +82,7 @@ module SR = struct
   let update_snapshot_info_dest ctx ~dbg ~sr ~vdi ~src_vdi ~snapshot_pairs =
     Storage_interface.unimplemented __FUNCTION__
 
-  let set_snapshot_relations_smapiv3 ctx ~dbg ~sr ~relations =
+  let set_snapshot_relations ctx ~dbg ~sr ~relations =
     Storage_interface.unimplemented __FUNCTION__
 
   let stat ctx ~dbg ~sr = Storage_interface.unimplemented __FUNCTION__
