@@ -732,10 +732,10 @@ module StorageAPI (R : RPC) = struct
         @-> returning unit_p err
         )
 
-    (** [set_snapshot_relations_smapiv3 sr relations] updates snapshot_of for a
-        list of destination snapshot VDIs and their leaf VDIs on a local SR.
-        This is used for SMAPIv3 migrations where snapshots are mirrored
-        directly onto the destination host. *)
+    (** [set_snapshot_relations_smapiv3 sr relations] establishes snapshot
+        relationships for mirrored SMAPIv3 VDIs. Each relation is a pair
+        (snapshot_vdi, leaf_vdi) where snapshot_vdi will be marked as a snapshot
+        of leaf_vdi. Used during SMAPIv3 migrations after snapshots are mirrored. *)
     let set_snapshot_relations_smapiv3 =
       let relations_p =
         Param.mk ~name:"relations"
