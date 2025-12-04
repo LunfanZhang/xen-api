@@ -1133,7 +1133,10 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
   (* Helper: set snapshot relationships on destination SR *)
   let set_snapshot_relations ~dest_sr ~leaf_vdi snapshot_mappings =
     let relations =
-      List.map (fun (_src, dest) -> (dest, leaf_vdi)) snapshot_mappings
+      List.map (fun (_src, dest, snapshot_time) ->
+        (* Convert flat tuple to RPC nested pair format *)
+        (dest, (leaf_vdi, snapshot_time))
+      ) snapshot_mappings
     in
     match relations with
     | [] ->
@@ -1141,13 +1144,13 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
     | _ ->
         debug "setting %d snapshot relation(s) on SR %s" (List.length relations)
           (Storage_interface.Sr.string_of dest_sr) ;
-        try SMAPI.SR.set_snapshot_relations_smapiv3 dbg dest_sr relations
+        try SMAPI.SR.set_snapshot_relations dbg dest_sr relations
         with e ->
           warn "failed to set snapshot relations on SR %s: %s"
             (Storage_interface.Sr.string_of dest_sr) (Printexc.to_string e)
   in
   (* Helper: create mirror record for a snapshot VDI *)
-  let create_snapshot_mirror_record (src_vdi, dest_vdi) =
+  let create_snapshot_mirror_record (src_vdi, dest_vdi, _snapshot_time) =
     let src_uuid = Storage_interface.Vdi.string_of src_vdi in
     let dest_uuid = Storage_interface.Vdi.string_of dest_vdi in
     try

@@ -732,16 +732,17 @@ module StorageAPI (R : RPC) = struct
         @-> returning unit_p err
         )
 
-    (** [set_snapshot_relations_smapiv3 sr relations] establishes snapshot
-        relationships for mirrored SMAPIv3 VDIs. Each relation is a pair
-        (snapshot_vdi, leaf_vdi) where snapshot_vdi will be marked as a snapshot
-        of leaf_vdi. Used during SMAPIv3 migrations after snapshots are mirrored. *)
-    let set_snapshot_relations_smapiv3 =
+    (** [set_snapshot_relations sr relations] establishes snapshot relationships
+        for mirrored VDIs. Each relation represents (snapshot_vdi, leaf_vdi, snapshot_time)
+        where snapshot_vdi will be marked as a snapshot of leaf_vdi with the given
+        snapshot_time (ISO8601 format). Used during migrations after snapshots are
+        mirrored to preserve snapshot metadata. *)
+    let set_snapshot_relations =
       let relations_p =
         Param.mk ~name:"relations"
-          TypeCombinators.(list (pair (Vdi.t, Vdi.t)))
+          TypeCombinators.(list (pair (Vdi.t, pair (Vdi.t, Types.string))))
       in
-      declare "SR.set_snapshot_relations_smapiv3" []
+      declare "SR.set_snapshot_relations" []
         (dbg_p @-> sr_p @-> relations_p @-> returning unit_p err)
 
     (** [update_snapshot_info_dest sr vdi dest src_vdi snapshot_pairs] updates
@@ -1503,11 +1504,11 @@ module type Server_impl = sig
       -> snapshot_pairs:(vdi * vdi_info) list
       -> unit
 
-    val set_snapshot_relations_smapiv3 :
+    val set_snapshot_relations :
          context
       -> dbg:debug_info
       -> sr:sr
-      -> relations:(vdi * vdi) list
+      -> relations:(vdi * vdi * string) list
       -> unit
 
     val stat : context -> dbg:debug_info -> sr:sr -> sr_info
@@ -1783,8 +1784,14 @@ module Server (Impl : Server_impl) () = struct
         Impl.SR.update_snapshot_info_dest () ~dbg ~sr ~vdi ~src_vdi
           ~snapshot_pairs
     ) ;
-    S.SR.set_snapshot_relations_smapiv3 (fun dbg sr relations ->
-        Impl.SR.set_snapshot_relations_smapiv3 () ~dbg ~sr ~relations
+    S.SR.set_snapshot_relations (fun dbg sr relations ->
+        (* Convert RPC nested pairs to flat tuples for implementation *)
+        let relations_flat =
+          List.map (fun (snapshot, (leaf, snapshot_time)) ->
+            (snapshot, leaf, snapshot_time)
+          ) relations
+        in
+        Impl.SR.set_snapshot_relations () ~dbg ~sr ~relations:relations_flat
     ) ;
     S.SR.stat (fun dbg sr -> Impl.SR.stat () ~dbg ~sr) ;
     S.SR.list (fun dbg -> Impl.SR.list () ~dbg) ;

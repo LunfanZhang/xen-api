@@ -357,16 +357,18 @@ module Mux = struct
           Db.VDI.set_snapshot_of ~__context ~self:vdi ~value:snapshot_of
       )
 
-    let set_snapshot_relations_smapiv3 () ~dbg ~sr ~relations =
-      with_dbg ~name:"SR.set_snapshot_relations_smapiv3" ~dbg @@ fun _di ->
-      debug "SR.set_snapshot_relations_smapiv3 dbg:%s sr:%s relations:%d"
+    let set_snapshot_relations () ~dbg ~sr ~relations =
+      with_dbg ~name:"SR.set_snapshot_relations" ~dbg @@ fun _di ->
+      debug "SR.set_snapshot_relations dbg:%s sr:%s relations:%d"
         dbg (s_of_sr sr) (List.length relations) ;
-      Server_helpers.exec_with_new_task "SR.set_snapshot_relations_smapiv3"
+      Server_helpers.exec_with_new_task "SR.set_snapshot_relations"
         ~subtask_of:(Ref.of_string dbg) (fun __context ->
           List.iter
-            (fun (snapshot, leaf) ->
+            (fun (snapshot, leaf, snapshot_time) ->
               let snapshot_ref, _ = find_vdi ~__context sr snapshot in
               let leaf_ref, _ = find_vdi ~__context sr leaf in
+              set_snapshot_time __context ~dbg ~sr ~vdi:snapshot
+                ~snapshot_time ;
               Db.VDI.set_snapshot_of ~__context ~self:snapshot_ref
                 ~value:leaf_ref ;
               Db.VDI.set_is_a_snapshot ~__context ~self:snapshot_ref

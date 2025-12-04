@@ -14,6 +14,7 @@
 
 module D = Debug.Make (struct let name = __MODULE__ end)
 
+module Date = Clock.Date
 module Unixext = Xapi_stdext_unix.Unixext
 module State = Storage_migrate_helper.State
 module SXM = Storage_migrate_helper.SXM
@@ -201,12 +202,10 @@ let nbd_export_of_attach_info backend =
       let _socket, export = Storage_interface.parse_nbd_uri nbd in
       Some export
 
-(** [get_snapshot_chain] retrieves the snapshot chain for a VDI from the database.
-    Returns UUIDs in base-to-leaf order (oldest first). The database stores them
-    in reverse chronological order, so we reverse the list. *)
-let get_snapshot_chain ~dbg ~sr ~vdi =
-  D.debug "%s getting snapshot chain for VDI %s on SR %s" __FUNCTION__
-    (s_of_vdi vdi) (s_of_sr sr) ;
+(** Retrieve snapshot chain for a VDI in base-to-leaf order.
+    Returns list of (uuid, snapshot_time) tuples to preserve metadata. *)
+let get_snapshot_chain ~dbg ~vdi =
+  D.debug "%s retrieving snapshot chain for VDI %s" __FUNCTION__ (s_of_vdi vdi) ;
   
   try
     Server_helpers.exec_with_new_task "get_snapshot_chain"
@@ -218,11 +217,16 @@ let get_snapshot_chain ~dbg ~sr ~vdi =
         D.debug "%s found %d snapshot(s) for VDI %s" __FUNCTION__
           (List.length snapshot_refs) vdi_uuid ;
         
-        let snapshot_uuids =
-          List.map (fun snap_ref -> Db.VDI.get_uuid ~__context ~self:snap_ref) snapshot_refs
+        let snapshot_data =
+          List.map (fun snap_ref ->
+            let uuid = Db.VDI.get_uuid ~__context ~self:snap_ref in
+            let snapshot_time = Db.VDI.get_snapshot_time ~__context ~self:snap_ref in
+            let snapshot_time_str = Date.to_rfc3339 snapshot_time in
+            (uuid, snapshot_time_str)
+          ) snapshot_refs
         in
         (* Reverse to get base-to-leaf order (oldest first) *)
-        List.rev snapshot_uuids
+        List.rev snapshot_data
       )
   with e ->
     D.error "%s failed to retrieve snapshot chain: %s" __FUNCTION__
@@ -245,9 +249,9 @@ let switch_vdi_to_writable ~dbg ~url ~verify_dest ~mirror_datapath ~dest_sr ~mir
   Remote.VDI.deactivate dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm ;
   Remote.VDI.activate3 dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm
 
-(** Mirror a single snapshot and record the mapping *)
+(** Mirror a single snapshot and record the mapping with metadata *)
 let mirror_single_snapshot ~dbg ~sr ~dest_sr ~url ~verify_dest ~mirror_vm ~copy_vm
-    ~mirror_vdi ~mirror_datapath ~nbd_uri ~idx ~total ~snapshot_uuid =
+    ~mirror_vdi ~mirror_datapath ~nbd_uri ~idx ~total ~snapshot_uuid ~snapshot_time =
   SXM.info "%s [%d/%d] mirroring snapshot %s" __FUNCTION__
     (idx + 1) total snapshot_uuid ;
   
@@ -265,9 +269,9 @@ let mirror_single_snapshot ~dbg ~sr ~dest_sr ~url ~verify_dest ~mirror_vm ~copy_
   D.debug "%s [%d/%d] snapshot %s mirrored to %s" __FUNCTION__
     (idx + 1) total snapshot_uuid (s_of_vdi dest_snapshot.vdi) ;
   
-  (Vdi.of_string snapshot_uuid, dest_snapshot.vdi)
+  (Vdi.of_string snapshot_uuid, dest_snapshot.vdi, snapshot_time)
 
-(** Process all snapshots in base-to-leaf order *)
+(** Process all snapshots in base-to-leaf order, preserving metadata *)
 let process_snapshots ~dbg ~sr ~dest_sr ~url ~verify_dest ~mirror_vm ~copy_vm
     ~mirror_vdi ~mirror_datapath ~nbd_uri ~snapshots =
   if snapshots = [] then
@@ -275,10 +279,10 @@ let process_snapshots ~dbg ~sr ~dest_sr ~url ~verify_dest ~mirror_vm ~copy_vm
   else (
     SXM.info "%s processing %d snapshot(s)" __FUNCTION__ (List.length snapshots) ;
     List.mapi
-      (fun idx snapshot_uuid ->
+      (fun idx (snapshot_uuid, snapshot_time) ->
         mirror_single_snapshot ~dbg ~sr ~dest_sr ~url ~verify_dest
           ~mirror_vm ~copy_vm ~mirror_vdi ~mirror_datapath ~nbd_uri
-          ~idx ~total:(List.length snapshots) ~snapshot_uuid
+          ~idx ~total:(List.length snapshots) ~snapshot_uuid ~snapshot_time
       )
       snapshots
   )
@@ -304,7 +308,7 @@ module MIRROR : SMAPIv2_MIRROR = struct
     let snapshot_mappings = ref [] in
     
     (* Get snapshot chain for migration *)
-    let snapshot_chain = get_snapshot_chain ~dbg ~sr ~vdi in
+    let snapshot_chain = get_snapshot_chain ~dbg ~vdi in
     if snapshot_chain <> [] then
       SXM.info "%s found %d snapshot(s) to mirror" __FUNCTION__ (List.length snapshot_chain) ;
     
