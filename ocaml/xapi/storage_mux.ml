@@ -359,17 +359,8 @@ module Mux = struct
 
     let set_snapshot_relations_smapiv3 () ~dbg ~sr ~relations =
       with_dbg ~name:"SR.set_snapshot_relations_smapiv3" ~dbg @@ fun _di ->
-      info
-        "SR.set_snapshot_relations_smapiv3 dbg:%s sr:%s relations:%s"
-        dbg (s_of_sr sr)
-        (relations
-         |> List.map (fun (snapshot, leaf) ->
-                Printf.sprintf "snapshot:%s leaf:%s"
-                  (s_of_vdi snapshot) (s_of_vdi leaf)
-            )
-         |> String.concat "; "
-         |> Printf.sprintf "[%s]"
-        ) ;
+      debug "SR.set_snapshot_relations_smapiv3 dbg:%s sr:%s relations:%d"
+        dbg (s_of_sr sr) (List.length relations) ;
       Server_helpers.exec_with_new_task "SR.set_snapshot_relations_smapiv3"
         ~subtask_of:(Ref.of_string dbg) (fun __context ->
           List.iter

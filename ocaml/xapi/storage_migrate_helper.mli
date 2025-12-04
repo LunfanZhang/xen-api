@@ -237,17 +237,19 @@ module State : sig
 
   val of_copy_id : string -> Storage_interface.sr * Storage_interface.vdi
 
-  type snapshot_mappings_table =
-    (string, (Storage_interface.Vdi.t * Storage_interface.Vdi.t) list) Hashtbl.t
-
-  val snapshot_mappings : snapshot_mappings_table
-
+  (** [set_snapshot_mappings mirror_id mappings] stores snapshot VDI mappings
+      for a mirror operation. Used during SMAPIv3 migrations to track source
+      and destination snapshot VDIs. *)
   val set_snapshot_mappings :
     string -> (Storage_interface.Vdi.t * Storage_interface.Vdi.t) list -> unit
 
+  (** [get_snapshot_mappings mirror_id] retrieves stored snapshot VDI mappings
+      for a mirror operation. Returns empty list if no mappings exist. *)
   val get_snapshot_mappings :
     string -> (Storage_interface.Vdi.t * Storage_interface.Vdi.t) list
 
+  (** [remove_snapshot_mappings mirror_id] cleans up snapshot VDI mappings
+      after a mirror operation completes. *)
   val remove_snapshot_mappings : string -> unit
 end
 

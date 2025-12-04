@@ -379,12 +379,8 @@ module Copy = struct
             ~dest_vdi:remote_base.vdi ~verify_dest
           |> vdi_info
         in
-        D.debug "Snapshotting remote VDI: %s" (Storage_interface.Vdi.string_of remote_copy.vdi) ;
         let snapshot = Remote.VDI.snapshot dbg dest remote_copy in
-        D.debug "Snapshot created: %s" (Storage_interface.Vdi.string_of snapshot.vdi) ;
-        D.debug "Destroying remote copy VDI: %s" (Storage_interface.Vdi.string_of remote_copy.vdi) ;
         Remote.VDI.destroy dbg dest remote_copy.vdi ;
-        D.debug "Returning snapshot as Vdi_info: %s" (Storage_interface.Vdi.string_of snapshot.vdi) ;
         Some (Vdi_info snapshot)
       with e ->
         D.error "Caught %s: copying snapshots vdi" (Printexc.to_string e) ;

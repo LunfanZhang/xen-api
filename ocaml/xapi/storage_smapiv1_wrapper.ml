@@ -1473,17 +1473,6 @@ functor
 
       let set_snapshot_relations_smapiv3 context ~dbg ~sr ~relations =
         with_dbg ~name:"SR.set_snapshot_relations_smapiv3" ~dbg @@ fun di ->
-        info
-          "SR.set_snapshot_relations_smapiv3 dbg:%s sr:%s relations:%s"
-          di.log (s_of_sr sr)
-          (relations
-           |> List.map (fun (snapshot, leaf) ->
-                  Printf.sprintf "snapshot:%s leaf:%s"
-                    (s_of_vdi snapshot) (s_of_vdi leaf)
-              )
-           |> String.concat "; "
-           |> Printf.sprintf "[%s]"
-          ) ;
         let dbg = Debug_info.to_string di in
         Impl.SR.set_snapshot_relations_smapiv3 context ~dbg ~sr ~relations
     end
