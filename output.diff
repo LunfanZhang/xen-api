@@ -1,0 +1,603 @@
+diff --git a/ocaml/xapi-idl/storage/storage_interface.ml b/ocaml/xapi-idl/storage/storage_interface.ml
+index eaabacc9e..3f1190899 100644
+--- a/ocaml/xapi-idl/storage/storage_interface.ml
++++ b/ocaml/xapi-idl/storage/storage_interface.ml
+@@ -732,6 +732,19 @@ module StorageAPI (R : RPC) = struct
+         @-> returning unit_p err
+         )
+ 
++    (** [set_snapshot_relations sr relations] establishes snapshot relationships
++        for mirrored VDIs. Each relation represents (snapshot_vdi, leaf_vdi, snapshot_time)
++        where snapshot_vdi will be marked as a snapshot of leaf_vdi with the given
++        snapshot_time (ISO8601 format). Used during migrations after snapshots are
++        mirrored to preserve snapshot metadata. *)
++    let set_snapshot_relations =
++      let relations_p =
++        Param.mk ~name:"relations"
++          TypeCombinators.(list (pair (Vdi.t, pair (Vdi.t, Types.string))))
++      in
++      declare "SR.set_snapshot_relations" []
++        (dbg_p @-> sr_p @-> relations_p @-> returning unit_p err)
++
+     (** [update_snapshot_info_dest sr vdi dest src_vdi snapshot_pairs] updates
+         the fields is_a_snapshot, snapshot_time and snapshot_of for a list of
+         snapshots on a local SR. Typically, vdi will be a mirror of src_vdi,
+@@ -1491,6 +1504,13 @@ module type Server_impl = sig
+       -> snapshot_pairs:(vdi * vdi_info) list
+       -> unit
+ 
++    val set_snapshot_relations :
++         context
++      -> dbg:debug_info
++      -> sr:sr
++      -> relations:(vdi * vdi * string) list
++      -> unit
++
+     val stat : context -> dbg:debug_info -> sr:sr -> sr_info
+ 
+     val list : context -> dbg:debug_info -> sr list
+@@ -1764,6 +1784,15 @@ module Server (Impl : Server_impl) () = struct
+         Impl.SR.update_snapshot_info_dest () ~dbg ~sr ~vdi ~src_vdi
+           ~snapshot_pairs
+     ) ;
++    S.SR.set_snapshot_relations (fun dbg sr relations ->
++        (* Convert RPC nested pairs to flat tuples for implementation *)
++        let relations_flat =
++          List.map (fun (snapshot, (leaf, snapshot_time)) ->
++            (snapshot, leaf, snapshot_time)
++          ) relations
++        in
++        Impl.SR.set_snapshot_relations () ~dbg ~sr ~relations:relations_flat
++    ) ;
+     S.SR.stat (fun dbg sr -> Impl.SR.stat () ~dbg ~sr) ;
+     S.SR.list (fun dbg -> Impl.SR.list () ~dbg) ;
+     S.VDI.create (fun dbg sr vdi_info -> Impl.VDI.create () ~dbg ~sr ~vdi_info) ;
+diff --git a/ocaml/xapi-idl/storage/storage_skeleton.ml b/ocaml/xapi-idl/storage/storage_skeleton.ml
+index a2d2d04ab..4878dd52c 100644
+--- a/ocaml/xapi-idl/storage/storage_skeleton.ml
++++ b/ocaml/xapi-idl/storage/storage_skeleton.ml
+@@ -82,6 +82,9 @@ module SR = struct
+   let update_snapshot_info_dest ctx ~dbg ~sr ~vdi ~src_vdi ~snapshot_pairs =
+     Storage_interface.unimplemented __FUNCTION__
+ 
++  let set_snapshot_relations ctx ~dbg ~sr ~relations =
++    Storage_interface.unimplemented __FUNCTION__
++
+   let stat ctx ~dbg ~sr = Storage_interface.unimplemented __FUNCTION__
+ 
+   let list ctx ~dbg = Storage_interface.unimplemented __FUNCTION__
+diff --git a/ocaml/xapi/storage_migrate_helper.ml b/ocaml/xapi/storage_migrate_helper.ml
+index f4c5d46c3..c1c79ed40 100644
+--- a/ocaml/xapi/storage_migrate_helper.ml
++++ b/ocaml/xapi/storage_migrate_helper.ml
+@@ -314,6 +314,31 @@ module State = struct
+           (Sr.of_string sr, Vdi.of_string (String.concat "/" rest))
+     | _ ->
+         failwith "Bad id"
++
++  (* Snapshot mappings storage for SMAPIv3 migrations.
++     Maps mirror_id -> list of (source_snapshot_vdi, dest_snapshot_vdi, snapshot_time) tuples.
++     This allows snapshot VMs' VBDs to be correctly updated and snapshot metadata preserved
++     after mirroring. The snapshot_time is in ISO8601 format. *)
++  type snapshot_mappings_table =
++    (string, (Storage_interface.Vdi.t * Storage_interface.Vdi.t * string) list)
++    Hashtbl.t
++
++  let snapshot_mappings : snapshot_mappings_table = Hashtbl.create 10
++
++  let set_snapshot_mappings mirror_id mappings =
++    Xapi_stdext_threads.Threadext.Mutex.execute mutex (fun () ->
++        Hashtbl.replace snapshot_mappings mirror_id mappings
++    )
++
++  let get_snapshot_mappings mirror_id =
++    Xapi_stdext_threads.Threadext.Mutex.execute mutex (fun () ->
++        Hashtbl.find_opt snapshot_mappings mirror_id |> Option.value ~default:[]
++    )
++
++  let remove_snapshot_mappings mirror_id =
++    Xapi_stdext_threads.Threadext.Mutex.execute mutex (fun () ->
++        Hashtbl.remove snapshot_mappings mirror_id
++    )
+ end
+ 
+ let vdi_info = function
+diff --git a/ocaml/xapi/storage_migrate_helper.mli b/ocaml/xapi/storage_migrate_helper.mli
+index 0f3a6ee8e..ad06d3998 100644
+--- a/ocaml/xapi/storage_migrate_helper.mli
++++ b/ocaml/xapi/storage_migrate_helper.mli
+@@ -236,6 +236,25 @@ module State : sig
+   val copy_id_of : Storage_interface.sr * Storage_interface.vdi -> string
+ 
+   val of_copy_id : string -> Storage_interface.sr * Storage_interface.vdi
++
++  (** [set_snapshot_mappings mirror_id mappings] stores snapshot VDI mappings
++      for a mirror operation. Each mapping is a tuple (src_vdi, dest_vdi, snapshot_time)
++      where snapshot_time is in ISO8601 format. Used during SMAPIv3 migrations to
++      track source and destination snapshot VDIs with their metadata. *)
++  val set_snapshot_mappings :
++       string
++    -> (Storage_interface.Vdi.t * Storage_interface.Vdi.t * string) list
++    -> unit
++
++  (** [get_snapshot_mappings mirror_id] retrieves stored snapshot VDI mappings
++      for a mirror operation. Returns a list of (src_vdi, dest_vdi, snapshot_time)
++      tuples, or empty list if no mappings exist. *)
++  val get_snapshot_mappings :
++    string -> (Storage_interface.Vdi.t * Storage_interface.Vdi.t * string) list
++
++  (** [remove_snapshot_mappings mirror_id] cleans up snapshot VDI mappings
++      after a mirror operation completes. *)
++  val remove_snapshot_mappings : string -> unit
+ end
+ 
+ val vdi_info :
+diff --git a/ocaml/xapi/storage_mux.ml b/ocaml/xapi/storage_mux.ml
+index 0427f76ca..92d878d8b 100644
+--- a/ocaml/xapi/storage_mux.ml
++++ b/ocaml/xapi/storage_mux.ml
+@@ -357,6 +357,26 @@ module Mux = struct
+           Db.VDI.set_snapshot_of ~__context ~self:vdi ~value:snapshot_of
+       )
+ 
++    let set_snapshot_relations () ~dbg ~sr ~relations =
++      with_dbg ~name:"SR.set_snapshot_relations" ~dbg @@ fun _di ->
++      debug "SR.set_snapshot_relations dbg:%s sr:%s relations:%d"
++        dbg (s_of_sr sr) (List.length relations) ;
++      Server_helpers.exec_with_new_task "SR.set_snapshot_relations"
++        ~subtask_of:(Ref.of_string dbg) (fun __context ->
++          List.iter
++            (fun (snapshot, leaf, snapshot_time) ->
++              let snapshot_ref, _ = find_vdi ~__context sr snapshot in
++              let leaf_ref, _ = find_vdi ~__context sr leaf in
++              set_snapshot_time __context ~dbg ~sr ~vdi:snapshot
++                ~snapshot_time ;
++              Db.VDI.set_snapshot_of ~__context ~self:snapshot_ref
++                ~value:leaf_ref ;
++              Db.VDI.set_is_a_snapshot ~__context ~self:snapshot_ref
++                ~value:true
++            )
++            relations
++        )
++
+     let update_snapshot_info_dest () ~dbg ~sr ~vdi ~src_vdi ~snapshot_pairs =
+       with_dbg ~name:"SR.update_snapshot_info_dest" ~dbg @@ fun _di ->
+       info
+diff --git a/ocaml/xapi/storage_smapiv1_wrapper.ml b/ocaml/xapi/storage_smapiv1_wrapper.ml
+index 86879780f..0ed1ce17c 100644
+--- a/ocaml/xapi/storage_smapiv1_wrapper.ml
++++ b/ocaml/xapi/storage_smapiv1_wrapper.ml
+@@ -1470,6 +1470,11 @@ functor
+         let dbg = Debug_info.to_string di in
+         Impl.SR.update_snapshot_info_dest context ~dbg ~sr ~vdi ~src_vdi
+           ~snapshot_pairs
++
++      let set_snapshot_relations context ~dbg ~sr ~relations =
++        with_dbg ~name:"SR.set_snapshot_relations" ~dbg @@ fun di ->
++        let dbg = Debug_info.to_string di in
++        Impl.SR.set_snapshot_relations context ~dbg ~sr ~relations
+     end
+ 
+     module Policy = struct
+diff --git a/ocaml/xapi/storage_smapiv3_migrate.ml b/ocaml/xapi/storage_smapiv3_migrate.ml
+index 774239c08..e0f4c857d 100644
+--- a/ocaml/xapi/storage_smapiv3_migrate.ml
++++ b/ocaml/xapi/storage_smapiv3_migrate.ml
+@@ -14,6 +14,7 @@
+ 
+ module D = Debug.Make (struct let name = __MODULE__ end)
+ 
++module Date = Clock.Date
+ module Unixext = Xapi_stdext_unix.Unixext
+ module State = Storage_migrate_helper.State
+ module SXM = Storage_migrate_helper.SXM
+@@ -68,6 +69,92 @@ let export_nbd_proxy ~remote_url ~mirror_vm ~sr ~vdi ~dp ~verify_dest =
+     Unix.close proxy_srv ;
+     raise e
+ 
++(** Polling interval for mirror operations (in seconds) *)
++let mirror_poll_interval = 0.5
++
++(** Wait for a mirror operation to complete, checking status periodically.
++    Raises Storage_error if the mirror fails. *)
++let wait_for_mirror_completion ~dbg ~sr ~vdi ~vm ~error_msg mirror_key =
++  let rec wait key =
++    let {failed; complete; progress} : Mirror.status =
++      Local.DATA.stat dbg sr vdi vm key
++    in
++    if complete then
++      Option.iter (fun p -> D.debug "%s mirror completed, progress: %f" __FUNCTION__ p) progress
++    else if failed then
++      raise (Storage_interface.Storage_error (Migration_mirror_failure error_msg))
++    else (
++      Option.iter (fun p -> D.debug "%s mirror progress: %f" __FUNCTION__ p) progress ;
++      Unix.sleepf mirror_poll_interval ;
++      wait key
++    )
++  in
++  match mirror_key with
++  | Storage_interface.Mirror.CopyV1 _ ->
++      ()
++  | Storage_interface.Mirror.MirrorV1 _ ->
++      wait mirror_key
++
++(** Attach and activate a snapshot VDI for reading *)
++let attach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm =
++  D.debug "%s attaching snapshot VDI %s with dp %s" __FUNCTION__
++    (s_of_vdi snapshot_vdi) dp ;
++  ignore (Local.VDI.attach3 dbg dp sr snapshot_vdi copy_vm false) ;
++  Local.VDI.activate_readonly dbg dp sr snapshot_vdi copy_vm
++
++(** Detach and deactivate a snapshot VDI *)
++let detach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm =
++  D.debug "%s detaching snapshot VDI %s" __FUNCTION__ (s_of_vdi snapshot_vdi) ;
++  Local.VDI.deactivate dbg dp sr snapshot_vdi copy_vm ;
++  Local.VDI.detach dbg dp sr snapshot_vdi copy_vm
++
++(** Create a snapshot of the destination VDI to preserve the mirrored state *)
++let create_destination_snapshot ~dbg ~dest_sr ~dest_url ~verify_dest ~dest_vdi_info =
++  let (module Remote) =
++    Storage_migrate_helper.get_remote_backend dest_url verify_dest
++  in
++  D.debug "%s creating snapshot of destination VDI %s" __FUNCTION__
++    (s_of_vdi dest_vdi_info.vdi) ;
++  Remote.VDI.snapshot dbg dest_sr
++    {dest_vdi_info with sm_config= [("snapshot_parent", "true")]}
++
++(** [mirror_snapshot_into_existing_dest] mirrors a single snapshot VDI into an
++    existing destination VDI (typically the mirror_vdi created by receive_start3).
++    After mirroring completes, it snapshots the destination VDI to preserve the
++    snapshot state. *)
++let mirror_snapshot_into_existing_dest ~dbg ~sr ~snapshot_vdi_uuid ~dest_sr
++    ~dest_url ~verify_dest ~mirror_vm ~copy_vm ~dest_vdi_info ~nbd_uri =
++  SXM.info "%s mirroring snapshot %s into VDI %s" __FUNCTION__
++    snapshot_vdi_uuid (s_of_vdi dest_vdi_info.vdi) ;
++
++  let snapshot_vdi = Vdi.of_string snapshot_vdi_uuid in
++  let dp = Uuidx.(to_string (make ())) in
++
++  try
++    attach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm ;
++    
++    D.debug "%s starting QEMU mirror from snapshot %s" __FUNCTION__ snapshot_vdi_uuid ;
++    let mirror_key = Local.DATA.mirror dbg sr snapshot_vdi copy_vm nbd_uri in
++    
++    wait_for_mirror_completion ~dbg ~sr ~vdi:snapshot_vdi ~vm:copy_vm
++      ~error_msg:(Printf.sprintf "Snapshot %s mirror failed" snapshot_vdi_uuid)
++      mirror_key ;
++    
++    detach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm ;
++    
++    let dest_snapshot =
++      create_destination_snapshot ~dbg ~dest_sr ~dest_url ~verify_dest ~dest_vdi_info
++    in
++    D.debug "%s destination snapshot created: %s" __FUNCTION__
++      (s_of_vdi dest_snapshot.vdi) ;
++    
++    dest_snapshot
++  with e ->
++    D.error "%s snapshot mirror failed: %s" __FUNCTION__ (Printexc.to_string e) ;
++    (* Best-effort cleanup *)
++    (try detach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm with _ -> ()) ;
++    raise e
++
+ let mirror_wait ~dbg ~sr ~vdi ~vm ~mirror_id mirror_key =
+   let rec mirror_wait_rec key =
+     let {failed; complete; progress} : Mirror.status =
+@@ -105,11 +192,106 @@ let mirror_wait ~dbg ~sr ~vdi ~vm ~mirror_id mirror_key =
+       D.debug "%s waiting for mirroring to be done" __FUNCTION__ ;
+       mirror_wait_rec mirror_key
+ 
++(** Helper to extract NBD export name from backend attach info *)
++let nbd_export_of_attach_info backend =
++  let _, _, _, nbds = Storage_interface.implementations_of_backend backend in
++  match nbds with
++  | [] ->
++      None
++  | nbd :: _ ->
++      let _socket, export = Storage_interface.parse_nbd_uri nbd in
++      Some export
++
++(** Retrieve snapshot chain for a VDI in base-to-leaf order.
++    Returns list of (uuid, snapshot_time) tuples to preserve metadata. *)
++let get_snapshot_chain ~dbg ~vdi =
++  D.debug "%s retrieving snapshot chain for VDI %s" __FUNCTION__ (s_of_vdi vdi) ;
++  
++  try
++    Server_helpers.exec_with_new_task "get_snapshot_chain"
++      ~subtask_of:(Ref.of_string dbg) (fun __context ->
++        let vdi_uuid = s_of_vdi vdi in
++        let vdi_ref = Db.VDI.get_by_uuid ~__context ~uuid:vdi_uuid in
++        let snapshot_refs = Db.VDI.get_snapshots ~__context ~self:vdi_ref in
++        
++        D.debug "%s found %d snapshot(s) for VDI %s" __FUNCTION__
++          (List.length snapshot_refs) vdi_uuid ;
++        
++        let snapshot_data =
++          List.map (fun snap_ref ->
++            let uuid = Db.VDI.get_uuid ~__context ~self:snap_ref in
++            let snapshot_time = Db.VDI.get_snapshot_time ~__context ~self:snap_ref in
++            let snapshot_time_str = Date.to_rfc3339 snapshot_time in
++            (uuid, snapshot_time_str)
++          ) snapshot_refs
++        in
++        (* Reverse to get base-to-leaf order (oldest first) *)
++        List.rev snapshot_data
++      )
++  with e ->
++    D.error "%s failed to retrieve snapshot chain: %s" __FUNCTION__
++      (Printexc.to_string e) ;
++    []
++
++(** Start NBD proxy thread for remote mirroring *)
++let start_nbd_proxy_thread ~url ~mirror_vm ~dest_sr ~mirror_vdi ~mirror_datapath ~verify_dest =
++  Thread.create
++    (fun () ->
++      export_nbd_proxy ~remote_url:url ~mirror_vm ~sr:dest_sr
++        ~vdi:mirror_vdi.vdi ~dp:mirror_datapath ~verify_dest
++    )
++    ()
++
++(** Switch destination VDI from readonly to writable mode *)
++let switch_vdi_to_writable ~dbg ~url ~verify_dest ~mirror_datapath ~dest_sr ~mirror_vdi ~mirror_vm =
++  let (module Remote) = Storage_migrate_helper.get_remote_backend url verify_dest in
++  D.debug "%s switching VDI %s to writable" __FUNCTION__ (s_of_vdi mirror_vdi.vdi) ;
++  Remote.VDI.deactivate dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm ;
++  Remote.VDI.activate3 dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm
++
++(** Mirror a single snapshot and record the mapping with metadata *)
++let mirror_single_snapshot ~dbg ~sr ~dest_sr ~url ~verify_dest ~mirror_vm ~copy_vm
++    ~mirror_vdi ~mirror_datapath ~nbd_uri ~idx ~total ~snapshot_uuid ~snapshot_time =
++  SXM.info "%s [%d/%d] mirroring snapshot %s" __FUNCTION__
++    (idx + 1) total snapshot_uuid ;
++  
++  (* Start fresh NBD proxy for this snapshot *)
++  let _ : Thread.t = start_nbd_proxy_thread ~url ~mirror_vm ~dest_sr
++    ~mirror_vdi ~mirror_datapath ~verify_dest in
++  Unix.sleepf mirror_poll_interval ;
++  
++  let dest_snapshot =
++    mirror_snapshot_into_existing_dest ~dbg ~sr ~snapshot_vdi_uuid:snapshot_uuid
++      ~dest_sr ~dest_url:url ~verify_dest ~mirror_vm ~copy_vm
++      ~dest_vdi_info:mirror_vdi ~nbd_uri
++  in
++  
++  D.debug "%s [%d/%d] snapshot %s mirrored to %s" __FUNCTION__
++    (idx + 1) total snapshot_uuid (s_of_vdi dest_snapshot.vdi) ;
++  
++  (Vdi.of_string snapshot_uuid, dest_snapshot.vdi, snapshot_time)
++
++(** Process all snapshots in base-to-leaf order, preserving metadata *)
++let process_snapshots ~dbg ~sr ~dest_sr ~url ~verify_dest ~mirror_vm ~copy_vm
++    ~mirror_vdi ~mirror_datapath ~nbd_uri ~snapshots =
++  if snapshots = [] then
++    []
++  else (
++    SXM.info "%s processing %d snapshot(s)" __FUNCTION__ (List.length snapshots) ;
++    List.mapi
++      (fun idx (snapshot_uuid, snapshot_time) ->
++        mirror_single_snapshot ~dbg ~sr ~dest_sr ~url ~verify_dest
++          ~mirror_vm ~copy_vm ~mirror_vdi ~mirror_datapath ~nbd_uri
++          ~idx ~total:(List.length snapshots) ~snapshot_uuid ~snapshot_time
++      )
++      snapshots
++  )
++
+ module MIRROR : SMAPIv2_MIRROR = struct
+   type context = unit
+ 
+   let send_start _ctx ~dbg ~task_id:_ ~dp ~sr ~vdi ~mirror_vm ~mirror_id
+-      ~local_vdi:_ ~copy_vm:_ ~live_vm ~url ~remote_mirror ~dest_sr ~verify_dest
++      ~local_vdi:_ ~copy_vm ~live_vm ~url ~remote_mirror ~dest_sr ~verify_dest
+       =
+     D.debug
+       "%s dbg: %s dp: %s sr: %s vdi:%s mirror_vm:%s mirror_id: %s live_vm: %s \
+@@ -121,9 +303,15 @@ module MIRROR : SMAPIv2_MIRROR = struct
+        activating the VDI again on dom 0 when it is already activated on the live_vm.
+        This means that if the VM shutsdown while SXM is in progress the
+        mirroring for SMAPIv3 will fail.*)
+-    let nbd_proxy_path =
+-      Printf.sprintf "/var/run/nbdproxy/export/%s" (Vm.string_of mirror_vm)
+-    in
++    
++    (* Track snapshot mappings created during mirroring *)
++    let snapshot_mappings = ref [] in
++    
++    (* Get snapshot chain for migration *)
++    let snapshot_chain = get_snapshot_chain ~dbg ~vdi in
++    if snapshot_chain <> [] then
++      SXM.info "%s found %d snapshot(s) to mirror" __FUNCTION__ (List.length snapshot_chain) ;
++    
+     match remote_mirror with
+     | Mirror.Vhd_mirror _ ->
+         raise
+@@ -134,20 +322,34 @@ module MIRROR : SMAPIv2_MIRROR = struct
+           )
+     | Mirror.SMAPIv3_mirror {nbd_export; mirror_datapath; mirror_vdi} -> (
+       try
++        let nbd_proxy_path =
++          Printf.sprintf "/var/run/nbdproxy/export/%s" (Vm.string_of mirror_vm)
++        in
+         let nbd_uri =
+           Uri.make ~scheme:"nbd+unix" ~host:"" ~path:nbd_export
+             ~query:[("socket", [nbd_proxy_path])]
+             ()
+           |> Uri.to_string
+         in
+-        let _ : Thread.t =
+-          Thread.create
+-            (fun () ->
+-              export_nbd_proxy ~remote_url:url ~mirror_vm ~sr:dest_sr
+-                ~vdi:mirror_vdi.vdi ~dp:mirror_datapath ~verify_dest
+-            )
+-            ()
++        (* Mirror snapshots and switch VDI to writable mode *)
++        let mappings =
++          process_snapshots ~dbg ~sr ~dest_sr ~url ~verify_dest
++            ~mirror_vm ~copy_vm ~mirror_vdi ~mirror_datapath ~nbd_uri
++            ~snapshots:snapshot_chain
+         in
++        snapshot_mappings := mappings ;
++        
++        if mappings <> [] then
++          SXM.info "%s %d snapshot(s) mirrored successfully" __FUNCTION__
++            (List.length mappings) ;
++        
++        switch_vdi_to_writable ~dbg ~url ~verify_dest ~mirror_datapath
++          ~dest_sr ~mirror_vdi ~mirror_vm ;
++        
++        (* Start NBD proxy for leaf mirror *)
++        D.debug "%s starting NBD proxy for leaf mirror" __FUNCTION__ ;
++        let _ : Thread.t = start_nbd_proxy_thread ~url ~mirror_vm ~dest_sr
++          ~mirror_vdi ~mirror_datapath ~verify_dest in
+ 
+         D.info "%s nbd_proxy_path: %s nbd_url %s" __FUNCTION__ nbd_proxy_path
+           nbd_uri ;
+@@ -174,7 +376,14 @@ module MIRROR : SMAPIv2_MIRROR = struct
+         State.add mirror_id (State.Send_op alm) ;
+         D.debug "%s Updated mirror_id %s in the active local mirror"
+           __FUNCTION__ mirror_id ;
+-        mirror_wait ~dbg ~sr ~vdi ~vm:live_vm ~mirror_id mk
++        mirror_wait ~dbg ~sr ~vdi ~vm:live_vm ~mirror_id mk ;
++        
++        (* Store snapshot mappings for retrieval by xapi_vm_migrate *)
++        if !snapshot_mappings <> [] then (
++          D.debug "%s storing %d snapshot mapping(s) for mirror %s" __FUNCTION__
++            (List.length !snapshot_mappings) mirror_id ;
++          State.set_snapshot_mappings mirror_id !snapshot_mappings
++        )
+       with e ->
+         D.error "%s caught exception during mirror: %s" __FUNCTION__
+           (Printexc.to_string e) ;
+@@ -222,9 +431,9 @@ module MIRROR : SMAPIv2_MIRROR = struct
+         | Some export ->
+             export
+       in
+-      D.debug "%s activating dp %s sr: %s vdi: %s vm: %s" __FUNCTION__ leaf_dp
++      D.debug "%s activating (readonly) dp %s sr: %s vdi: %s vm: %s" __FUNCTION__ leaf_dp
+         (s_of_sr sr) (s_of_vdi leaf.vdi) (s_of_vm vm) ;
+-      Remote.VDI.activate3 dbg leaf_dp sr leaf.vdi vm ;
++      Remote.VDI.activate_readonly dbg leaf_dp sr leaf.vdi vm ;
+       let qcow2_res =
+         {Mirror.mirror_vdi= leaf; mirror_datapath= leaf_dp; nbd_export}
+       in
+diff --git a/ocaml/xapi/xapi_vm_migrate.ml b/ocaml/xapi/xapi_vm_migrate.ml
+index 814ed70ac..a01404fb6 100644
+--- a/ocaml/xapi/xapi_vm_migrate.ml
++++ b/ocaml/xapi/xapi_vm_migrate.ml
+@@ -1118,6 +1118,67 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
+       else
+         raise e
+   in
++  (* Helper: retrieve snapshot mappings from migration state *)
++  let get_snapshot_mappings mirror_id =
++    match mirror_id with
++    | Some mid ->
++        let mappings = Storage_migrate_helper.State.get_snapshot_mappings mid in
++        if mappings <> [] then
++          debug "retrieved %d snapshot mapping(s) for mirror %s"
++            (List.length mappings) mid ;
++        mappings
++    | None ->
++        []
++  in
++  (* Helper: set snapshot relationships on destination SR *)
++  let set_snapshot_relations ~dest_sr ~leaf_vdi snapshot_mappings =
++    let relations =
++      List.map (fun (_src, dest, snapshot_time) ->
++        (* Convert flat tuple to RPC nested pair format *)
++        (dest, (leaf_vdi, snapshot_time))
++      ) snapshot_mappings
++    in
++    match relations with
++    | [] ->
++        ()
++    | _ ->
++        debug "setting %d snapshot relation(s) on SR %s" (List.length relations)
++          (Storage_interface.Sr.string_of dest_sr) ;
++        try SMAPI.SR.set_snapshot_relations dbg dest_sr relations
++        with e ->
++          warn "failed to set snapshot relations on SR %s: %s"
++            (Storage_interface.Sr.string_of dest_sr) (Printexc.to_string e)
++  in
++  (* Helper: create mirror record for a snapshot VDI *)
++  let create_snapshot_mirror_record (src_vdi, dest_vdi, _snapshot_time) =
++    let src_uuid = Storage_interface.Vdi.string_of src_vdi in
++    let dest_uuid = Storage_interface.Vdi.string_of dest_vdi in
++    try
++      let src_ref = Db.VDI.get_by_uuid ~__context ~uuid:src_uuid in
++      let dest_ref =
++        XenAPI.VDI.get_by_uuid ~rpc:remote.rpc ~session_id:remote.session
++          ~uuid:dest_uuid
++      in
++      Some
++        {
++          mr_dp= None
++        ; mr_mirrored= false
++        ; mr_local_sr= vconf.sr
++        ; mr_local_vdi= src_vdi
++        ; mr_remote_sr= dest_sr
++        ; mr_remote_vdi= dest_vdi
++        ; mr_local_xenops_locator=
++            Xapi_xenops.xenops_vdi_locator ~__context ~self:src_ref
++        ; mr_remote_xenops_locator=
++            Xapi_xenops.xenops_vdi_locator_of dest_sr dest_vdi
++        ; mr_local_vdi_reference= src_ref
++        ; mr_remote_vdi_reference= dest_ref
++        }
++    with e ->
++      warn "failed to create mirror record for snapshot %s: %s" src_uuid
++        (Printexc.to_string e) ;
++      None
++  in
+   if mirror then
+     with_new_dp (fun new_dp ->
+         let mirror_id, remote_vdi = mirror_to_remote new_dp in
+@@ -1125,7 +1186,17 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
+             let mirror_record =
+               get_mirror_record ~new_dp remote_vdi remote_vdi_ref
+             in
+-            post_mirror mirror_id mirror_record
++            let snapshot_mappings = get_snapshot_mappings mirror_id in
++            set_snapshot_relations ~dest_sr ~leaf_vdi:remote_vdi
++              snapshot_mappings ;
++            let snapshot_mirror_records =
++              List.filter_map create_snapshot_mirror_record snapshot_mappings
++            in
++            let result = post_mirror mirror_id mirror_record in
++            List.iter (fun mr -> ignore (continuation mr)) snapshot_mirror_records ;
++            Option.iter Storage_migrate_helper.State.remove_snapshot_mappings
++              mirror_id ;
++            result
+         )
+     )
+   else
+@@ -1342,10 +1413,24 @@ let migrate_send' ~__context ~vm ~dest ~live:_ ~vdi_map ~vif_map ~vgpu_map
+     in
+     if pool_suspend_SR <> Ref.null then pool_suspend_SR else host_suspend_SR
+   in
+-  (* Resolve placement of unspecified VDIs here - unspecified VDIs that
+-            are 'snapshot_of' a specified VDI go to the same place. suspend VDIs
+-            that are unspecified go to the suspend_sr_ref defined above *)
+-  let extra_vdis = suspends_vdis @ snapshots_vdis in
++  (* Resolve placement of unspecified VDIs here. Unspecified VDIs that
++     are 'snapshot_of' a specified VDI go to the same place. Suspend VDIs
++     that are unspecified go to the suspend_sr_ref defined above.
++     
++     SMAPIv3: snapshot VDIs are mirrored during send_start, only copy suspends.
++     SMAPIv1: both snapshots and suspends must be explicitly copied. *)
++  let has_smapiv3_snapshots =
++    List.exists
++      (fun vconf -> Storage_mux_reg.smapi_version_of_sr vconf.sr = SMAPIv3)
++      snapshots_vdis
++  in
++  let extra_vdis =
++    if has_smapiv3_snapshots then (
++      debug "excluding SMAPIv3 snapshots from copy list (already mirrored)" ;
++      suspends_vdis
++    ) else
++      suspends_vdis @ snapshots_vdis
++  in
+   let extra_vdi_map =
+     List.map
+       (fun vconf ->
