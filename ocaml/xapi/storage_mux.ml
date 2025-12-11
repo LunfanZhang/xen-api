@@ -426,7 +426,19 @@ module Mux = struct
               set_snapshot_of __context ~dbg ~sr ~vdi:local_snapshot
                 ~snapshot_of:vdi ;
               set_is_a_snapshot __context ~dbg ~sr ~vdi:local_snapshot
-                ~is_a_snapshot:true
+                ~is_a_snapshot:true ;
+              (* Also update storage backend metadata so SR.scan doesn't overwrite
+                 with stale data from custom keys *)
+              let module C = StorageAPI (Idl.Exn.GenClient (struct
+                let rpc = of_sr sr
+              end)) in
+              (try
+                C.VDI.set_snapshot_metadata (Debug_info.to_string _di) sr local_snapshot 
+                  vdi src_snapshot_info.snapshot_time true
+              with e ->
+                debug "Failed to update snapshot metadata in storage backend for %s: %s"
+                  (s_of_vdi local_snapshot) (Printexc.to_string e)
+              )
             )
             snapshot_pairs
       )
@@ -717,6 +729,15 @@ module Mux = struct
         let rpc = of_sr sr
       end)) in
       C.VDI.set_content_id (Debug_info.to_string di) sr vdi content_id
+
+    let set_snapshot_metadata () ~dbg ~sr ~vdi ~snapshot_of ~snapshot_time ~is_a_snapshot =
+      with_dbg ~name:"VDI.set_snapshot_metadata" ~dbg @@ fun di ->
+      info "VDI.set_snapshot_metadata dbg:%s sr:%s vdi:%s snapshot_of:%s" dbg
+        (s_of_sr sr) (s_of_vdi vdi) (s_of_vdi snapshot_of) ;
+      let module C = StorageAPI (Idl.Exn.GenClient (struct
+        let rpc = of_sr sr
+      end)) in
+      C.VDI.set_snapshot_metadata (Debug_info.to_string di) sr vdi snapshot_of snapshot_time is_a_snapshot
 
     let similar_content () ~dbg ~sr ~vdi =
       with_dbg ~name:"VDI.similar_content" ~dbg @@ fun di ->
