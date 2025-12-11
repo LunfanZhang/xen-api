@@ -769,7 +769,17 @@ module MIRROR : SMAPIv2_MIRROR = struct
         (* On SMAPIv3, compose would have removed the now invalid dummy vdi, so
            there is no need to destroy it anymore, while this is necessary on SMAPIv1 SRs. *)
         D.log_and_ignore_exn (fun () -> SMAPI.VDI.destroy dbg r.sr r.dummy_vdi) ;
-        SMAPI.VDI.remove_from_sm_config dbg r.sr r.leaf_vdi "base_mirror"
+        SMAPI.VDI.remove_from_sm_config dbg r.sr r.leaf_vdi "base_mirror" ;
+        (* Trigger SR.scan to ensure database is updated after compose and dummy VDI removal.
+           This ensures the dummy VDI is removed from the database and snapshot metadata
+           (which was updated via set_snapshot_metadata in the storage backend) is properly
+           reflected in the xapi database. *)
+        D.log_and_ignore_exn (fun () ->
+          SXM.info "%s Scanning SR %s to update VDI database after migration" 
+            __FUNCTION__ (Sr.string_of r.sr) ;
+          let _ = SMAPI.SR.scan dbg r.sr in
+          ()
+        )
       )
       recv_state ;
     State.remove_receive_mirror mirror_id
