@@ -1986,6 +1986,7 @@ let bind ~volume_script_dir =
   S.VDI.get_by_name (u "VDI.get_by_name") ;
   S.UPDATES.get (u "UPDATES.get") ;
   S.SR.update_snapshot_info_dest (u "SR.update_snapshot_info_dest") ;
+  S.SR.set_snapshot_relations (u "SR.set_snapshot_relations") ;
   S.TASK.stat (u "TASK.stat") ;
   S.DP.diagnostics (u "DP.diagnostics") ;
   S.TASK.destroy (u "TASK.destroy") ;
