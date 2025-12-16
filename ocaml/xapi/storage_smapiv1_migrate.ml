@@ -779,12 +779,19 @@ module MIRROR : SMAPIv2_MIRROR = struct
         (* Trigger SR.scan to ensure database is updated after compose and dummy VDI removal.
            This ensures the dummy VDI is removed from the database and snapshot metadata
            (which was updated via set_snapshot_metadata in the storage backend) is properly
-           reflected in the xapi database. *)
+           reflected in the xapi database. We must use the full Xapi API scan (not just the
+           storage backend scan) to trigger update_vdis which updates VDI relationships. *)
         D.log_and_ignore_exn (fun () ->
-          SXM.info "%s Scanning SR %s to update VDI database after migration" 
+          SXM.info "%s Scanning SR from XAPI  %s to update VDI database after migration"
             __FUNCTION__ (Sr.string_of r.sr) ;
-          let _ = SMAPI.SR.scan dbg r.sr in
-          ()
+          Server_helpers.exec_with_new_task "SR.scan after migration finalize"
+            (fun __context ->
+              let sr_uuid = Sr.string_of r.sr in
+              let sr_ref = Db.SR.get_by_uuid ~__context ~uuid:sr_uuid in
+              Helpers.call_api_functions ~__context (fun rpc session_id ->
+                Client.Client.SR.scan ~rpc ~session_id ~sr:sr_ref
+              )
+            )
         )
       )
       recv_state ;
