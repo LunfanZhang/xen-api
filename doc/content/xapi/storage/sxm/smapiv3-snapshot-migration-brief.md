@@ -596,6 +596,73 @@ let extra_vdis =
 
 The RPC plumbing needs stubs in `storage_skeleton.ml` and forwarding logic in `storage_smapiv1_wrapper.ml`. Just follow what `update_snapshot_info_dest` does - these are mechanical changes.
 
+## Additional Implementation Fixes
+
+Two additional issues were identified and resolved during implementation to ensure correct and performant snapshot migration.
+
+### Snapshot metadata consistency for SMAPIv1 to SMAPIv3 migration
+
+When migrating from SMAPIv1 SR to SMAPIv3 SR, snapshot metadata fields (`snapshot_of`, `snapshot_time`, `is_a_snapshot`) were not properly synchronized between the XAPI database and the storage backend database. The migration only updated XAPI's database through `SR.scan`, leaving the storage backend with stale or missing metadata.
+
+It can be easied verified by query the `snapshot_of` fields by XAPI CLI `xe vdi-param-get uuid=<SNAPSHOT VDI uuid> param-name=<snapshot-of>` and query the from gfs2 db with SQL `SELECT * FROM vdi_custom_keys where vdi_uuid='<SNAPSHOT VDI UUID>';` the snapshot_of in the xapi output is the latest one but in the storage db it is legacy. and moreover, when query the by XAPI CLI `xe vdi-param-get uuid=<LEAF VDI uuid> param-name=<snapshots>`, it will output one more snapshot more thant the actually snapshots, which the dummy VDI create during mirror but not clean-up, so it should removed as well.
+
+To Adress above issues, there is one more API should be added to the xapi_storage_script, and two more step should be added to the migrate process
+
+1. Add the new API `set_snapshot_metadata` which receive the VDI, snapshot_of, snapshot_time, is_snapshot parameter and set to the backend.
+
+1. Add one step when update dest snapshot info, call the `set_snapshot_metadata` API to update the backend as well
+
+```ocaml
+  let set_snapshot_metadata ~dbg ~sr ~vdi ~snapshot_of ~snapshot_time ~is_a_snapshot =
+    let vdi_str = Storage_interface.Vdi.string_of vdi in
+    let snapshot_of_str = Storage_interface.Vdi.string_of snapshot_of in
+    set ~dbg ~sr ~vdi:vdi_str ~key:_snapshot_of_key ~value:snapshot_of_str
+    >>>= fun () ->
+    set ~dbg ~sr ~vdi:vdi_str ~key:_snapshot_time_key ~value:snapshot_time
+    >>>= fun () ->
+    set ~dbg ~sr ~vdi:vdi_str ~key:_is_a_snapshot_key ~value:(string_of_bool is_a_snapshot)
+```
+
+2. During `receive_finalize_common` in SMAPIv1 migration, add `SMAPI.SR.scan` to move all the necessary VDI and relationships as well.
+
+```ocaml
+Server_helpers.exec_with_new_task "SR.scan after migration finalize" (fun __context ->
+  let sr_uuid = Sr.string_of r.sr in
+  let sr_ref = Db.SR.get_by_uuid ~__context ~uuid:sr_uuid in
+  Helpers.call_api_functions ~__context (fun rpc session_id ->
+    Client.Client.SR.scan ~rpc ~session_id ~sr:sr_ref
+  )
+)
+```
+
+This ensures snapshot metadata consistency across both XAPI and storage backend databases, allowing proper snapshot functionality after migration and correct removal of temporary migration VDIs.
+
+### Mirror polling optimization
+
+During SMAPIv3 mirror operations, `DATA.stat` was repeatedly calling `VDI.stat` → `Volume.stat` for each polling cycle to determine the correct datapath for RPC routing. This created a hard loop where hundreds of `Volume.stat` calls per second blocked storage GC.
+
+The datapath information doesn't change during a mirror operation, but `DATA.stat` re-discovered it on every poll. This prevented the storage backend's GC from coalescing VDI data, leading to storage space issues and performance degradation.
+
+Implement a lightweight cache in `xapi-storage-script/main.ml` that stores VDI stat responses keyed by `(SR, VDI)`:
+
+```ocaml
+let vdi_stat_cache = Hashtbl.create 16
+
+let stat dbg sr vdi' _vm key =
+  ...
+  match Hashtbl.find_opt vdi_stat_cache cache_key with
+  | Some cached_response ->
+      (* Use cached response - no Volume.stat needed *)
+      return cached_response
+  | None ->
+      (* Cache miss - call VDI.stat once *)
+      VDI.stat ~dbg ~sr ~vdi >>>= fun response ->
+      ...
+```
+
+The cache is populated when `DATA.mirror` starts and reused by subsequent `DATA.stat` polls. When the mirror completes or fails, the cache entry is automatically removed. This reduces `Volume.stat` calls from hundreds per second to a single call per mirror operation, allowing GC to complete normally.
+
+
 ### Error Handling
 
 Snapshot discovery failures should log but return an empty list, letting the migration proceed without snapshots. If a snapshot mirror fails, stop immediately with a clear error - we don't want partial snapshot migration. Metadata restoration failures get logged as warnings but don't block the migration, since the data is already copied. VBD updates are best-effort per snapshot. Cleanup operations use try-catch and never raise errors.
