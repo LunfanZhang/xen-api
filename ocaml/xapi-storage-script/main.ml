@@ -1794,6 +1794,10 @@ end
 module DATAImpl (M : META) = struct
   module VDI = VDIImpl (M)
 
+  (* Lightweight cache to avoid repeated Volume.stat calls during mirror polling.
+     Cache VDI.stat responses keyed by (SR, VDI). Populated by mirror, used by stat. *)
+  let vdi_stat_cache = Hashtbl.create 16
+
   let stat dbg sr vdi' _vm key =
     let open Storage_interface in
     let convert_key = function
@@ -1803,40 +1807,62 @@ module DATAImpl (M : META) = struct
           Data_client.MirrorV1 k
     in
 
+    let sr_str = Sr.string_of sr in
     let vdi = Vdi.string_of vdi' in
+    let cache_key = (sr_str, vdi) in
+
     Attached_SRs.find sr >>>= fun sr ->
-    VDI.stat ~dbg ~sr ~vdi >>>= fun response ->
-    ( match
-        List.assoc_opt _clone_on_boot_key response.Xapi_storage.Control.keys
-      with
-      | None ->
-          return response
-      | Some temporary ->
-          VDI.stat ~dbg ~sr ~vdi:temporary
-      )
+    (* Check cache to avoid Volume.stat call *)
+    ( match Hashtbl.find_opt vdi_stat_cache cache_key with
+    | Some cached_response ->
+        (* Use cached response - no Volume.stat needed *)
+        return cached_response
+    | None ->
+        (* Cache miss - must call VDI.stat (which calls Volume.stat) *)
+        VDI.stat ~dbg ~sr ~vdi >>>= fun response ->
+        ( match
+            List.assoc_opt _clone_on_boot_key response.Xapi_storage.Control.keys
+          with
+        | None ->
+            return response
+        | Some temporary ->
+            VDI.stat ~dbg ~sr ~vdi:temporary
+        )
+    )
     >>>= fun response ->
     choose_datapath response >>>= fun (rpc, _datapath, _uri) ->
     let key = convert_key key in
     return_data_rpc (fun () -> Data_client.stat (rpc ~dbg) dbg key)
     >>>= function
     | {failed; complete; progress} ->
+        (* Clean up cache when mirror completes or fails *)
+        if complete || failed then
+          Hashtbl.remove vdi_stat_cache cache_key ;
         return Mirror.{failed; complete; progress}
 
   let stat_impl dbg sr vdi vm key = wrap @@ stat dbg sr vdi vm key
 
   let mirror dbg sr vdi' vm' remote =
+    let sr_str = Storage_interface.Sr.string_of sr in
     let vdi = Storage_interface.Vdi.string_of vdi' in
     let domain = Storage_interface.Vm.string_of vm' in
+    let cache_key = (sr_str, vdi) in
+
     Attached_SRs.find sr >>>= fun sr ->
     VDI.stat ~dbg ~sr ~vdi >>>= fun response ->
     ( match
         List.assoc_opt _clone_on_boot_key response.Xapi_storage.Control.keys
       with
-      | None ->
-          return response
-      | Some temporary ->
-          VDI.stat ~dbg ~sr ~vdi:temporary
-      )
+    | None ->
+        (* Cache the response to avoid repeated Volume.stat during polling *)
+        Hashtbl.replace vdi_stat_cache cache_key response ;
+        return response
+    | Some temporary ->
+        VDI.stat ~dbg ~sr ~vdi:temporary >>>= fun temp_response ->
+        (* Cache the temporary VDI response *)
+        Hashtbl.replace vdi_stat_cache cache_key temp_response ;
+        return temp_response
+    )
     >>>= fun response ->
     choose_datapath response >>>= fun (rpc, _datapath, uri) ->
     return_data_rpc (fun () ->
