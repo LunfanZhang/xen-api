@@ -379,7 +379,19 @@ module Mux = struct
               Db.VDI.set_snapshot_of ~__context ~self:snapshot_ref
                 ~value:leaf_ref ;
               Db.VDI.set_is_a_snapshot ~__context ~self:snapshot_ref
-                ~value:true
+                ~value:true ;
+              (* Also update storage backend metadata so SR.scan doesn't overwrite
+                 with stale data from custom keys *)
+              let module C = StorageAPI (Idl.Exn.GenClient (struct
+                let rpc = of_sr sr
+              end)) in
+              (try
+                C.VDI.set_snapshot_metadata (Debug_info.to_string _di) sr
+                  snapshot leaf snapshot_time true
+              with e ->
+                debug "Failed to update snapshot metadata in storage backend for %s: %s"
+                  (s_of_vdi snapshot) (Printexc.to_string e)
+              )
             )
             relations
         )

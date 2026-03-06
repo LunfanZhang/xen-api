@@ -782,7 +782,7 @@ module MIRROR : SMAPIv2_MIRROR = struct
            reflected in the xapi database. We must use the full Xapi API scan (not just the
            storage backend scan) to trigger update_vdis which updates VDI relationships. *)
         D.log_and_ignore_exn (fun () ->
-          SXM.info "%s Scanning SR from XAPI  %s to update VDI database after migration"
+          SXM.info "%s Scanning SR %s to update VDI database after migration"
             __FUNCTION__ (Sr.string_of r.sr) ;
           Server_helpers.exec_with_new_task "SR.scan after migration finalize"
             (fun __context ->

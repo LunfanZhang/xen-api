@@ -1430,21 +1430,13 @@ let migrate_send' ~__context ~vm ~dest ~live:_ ~vdi_map ~vif_map ~vgpu_map
   (* Resolve placement of unspecified VDIs here. Unspecified VDIs that
      are 'snapshot_of' a specified VDI go to the same place. Suspend VDIs
      that are unspecified go to the suspend_sr_ref defined above.
-     
-     SMAPIv3: snapshot VDIs are mirrored during send_start, only copy suspends.
-     SMAPIv1: both snapshots and suspends must be explicitly copied. *)
-  let has_smapiv3_snapshots =
-    List.exists
-      (fun vconf -> Storage_mux_reg.smapi_version_of_sr vconf.sr = SMAPIv3)
+     SMAPIv3 snapshots are excluded because they are mirrored during send_start. *)
+  let copyable_snapshots =
+    List.filter
+      (fun vconf -> Storage_mux_reg.smapi_version_of_sr vconf.sr <> SMAPIv3)
       snapshots_vdis
   in
-  let extra_vdis =
-    if has_smapiv3_snapshots then (
-      debug "excluding SMAPIv3 snapshots from copy list (already mirrored)" ;
-      suspends_vdis
-    ) else
-      suspends_vdis @ snapshots_vdis
-  in
+  let extra_vdis = suspends_vdis @ copyable_snapshots in
   let extra_vdi_map =
     List.map
       (fun vconf ->

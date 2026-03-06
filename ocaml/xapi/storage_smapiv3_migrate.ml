@@ -77,28 +77,42 @@ let export_nbd_proxy ~remote_url ~mirror_vm ~sr ~vdi ~dp ~verify_dest =
 (** Polling interval for mirror operations (in seconds) *)
 let mirror_poll_interval = 0.5
 
-(** Wait for a mirror operation to complete, checking status periodically.
-    Raises Storage_error if the mirror fails. *)
-let wait_for_mirror_completion ~dbg ~sr ~vdi ~vm ~error_msg mirror_key =
-  let rec wait key =
+(** Wait for a mirror operation to complete, polling status periodically.
+    @param mirror_id When provided, updates Send_state on failure and fires
+                     Updates (used for leaf VDI mirrors tracked by the framework).
+    @param error_msg Description included in the Migration_mirror_failure error.
+    Raises Storage_error(Migration_mirror_failure) if the mirror fails. *)
+let wait_for_mirror ~dbg ~sr ~vdi ~vm ?mirror_id ~error_msg mirror_key =
+  let on_failure () =
+    match mirror_id with
+    | Some mid ->
+        State.find_active_local_mirror mid
+        |> Option.iter (fun (s : State.Send_state.t) -> s.failed <- true) ;
+        Updates.add (Dynamic.Mirror mid) updates
+    | None ->
+        ()
+  in
+  let rec poll key =
     let {failed; complete; progress} : Mirror.status =
       Local.DATA.stat dbg sr vdi vm key
     in
     if complete then
-      Option.iter (fun p -> D.debug "%s mirror completed, progress: %f" __FUNCTION__ p) progress
-    else if failed then
+      Option.iter (fun p -> D.debug "%s mirror completed, progress: %.2f" __FUNCTION__ p) progress
+    else if failed then (
+      on_failure () ;
       raise (Storage_interface.Storage_error (Migration_mirror_failure error_msg))
-    else (
-      Option.iter (fun p -> D.debug "%s mirror progress: %f" __FUNCTION__ p) progress ;
+    ) else (
+      Option.iter (fun p -> D.debug "%s mirror progress: %.2f" __FUNCTION__ p) progress ;
       Unix.sleepf mirror_poll_interval ;
-      wait key
+      poll key
     )
   in
   match mirror_key with
   | Storage_interface.Mirror.CopyV1 _ ->
       ()
   | Storage_interface.Mirror.MirrorV1 _ ->
-      wait mirror_key
+      D.debug "%s waiting for mirror to complete" __FUNCTION__ ;
+      poll mirror_key
 
 (** Attach and activate a snapshot VDI for reading *)
 let attach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm =
@@ -141,7 +155,7 @@ let mirror_snapshot_into_existing_dest ~dbg ~sr ~snapshot_vdi_uuid ~dest_sr
     D.debug "%s starting QEMU mirror from snapshot %s" __FUNCTION__ snapshot_vdi_uuid ;
     let mirror_key = Local.DATA.mirror dbg sr snapshot_vdi copy_vm nbd_uri in
     
-    wait_for_mirror_completion ~dbg ~sr ~vdi:snapshot_vdi ~vm:copy_vm
+    wait_for_mirror ~dbg ~sr ~vdi:snapshot_vdi ~vm:copy_vm
       ~error_msg:(Printf.sprintf "Snapshot %s mirror failed" snapshot_vdi_uuid)
       mirror_key ;
     
@@ -159,43 +173,6 @@ let mirror_snapshot_into_existing_dest ~dbg ~sr ~snapshot_vdi_uuid ~dest_sr
     (* Best-effort cleanup *)
     (try detach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm with _ -> ()) ;
     raise e
-
-let mirror_wait ~dbg ~sr ~vdi ~vm ~mirror_id mirror_key =
-  let rec mirror_wait_rec key =
-    let {failed; complete; progress} : Mirror.status =
-      Local.DATA.stat dbg sr vdi vm key
-    in
-    if complete then (
-      Option.fold ~none:()
-        ~some:(fun p -> D.info "%s progress is %f" __FUNCTION__ p)
-        progress ;
-      D.info "%s qemu mirror %s completed" mirror_id __FUNCTION__
-    ) else if failed then (
-      Option.iter
-        (fun (snd_state : State.Send_state.t) -> snd_state.failed <- true)
-        (State.find_active_local_mirror mirror_id) ;
-      D.info "%s qemu mirror %s failed" mirror_id __FUNCTION__ ;
-      State.find_active_local_mirror mirror_id
-      |> Option.iter (fun (s : State.Send_state.t) -> s.failed <- true) ;
-      Updates.add (Dynamic.Mirror mirror_id) updates ;
-      raise
-        (Storage_interface.Storage_error
-           (Migration_mirror_failure "Mirror failed during syncing")
-        )
-    ) else (
-      Option.fold ~none:()
-        ~some:(fun p -> D.info "%s progress is %f" __FUNCTION__ p)
-        progress ;
-      mirror_wait_rec key
-    )
-  in
-
-  match mirror_key with
-  | Storage_interface.Mirror.CopyV1 _ ->
-      ()
-  | Storage_interface.Mirror.MirrorV1 _ ->
-      D.debug "%s waiting for mirroring to be done" __FUNCTION__ ;
-      mirror_wait_rec mirror_key
 
 (** Helper to extract NBD export name from backend attach info *)
 let nbd_export_of_attach_info backend =
@@ -230,8 +207,9 @@ let get_snapshot_chain ~dbg ~vdi =
             (uuid, snapshot_time_str)
           ) snapshot_refs
         in
-        (* Reverse to get base-to-leaf order (oldest first) *)
-        List.rev snapshot_data
+        (* Sort by snapshot_time ascending (oldest first = base-to-leaf order).
+           RFC3339 timestamps sort lexicographically. *)
+        List.sort (fun (_, t1) (_, t2) -> String.compare t1 t2) snapshot_data
       )
   with e ->
     D.error "%s failed to retrieve snapshot chain: %s" __FUNCTION__
@@ -247,7 +225,14 @@ let start_nbd_proxy_thread ~url ~mirror_vm ~dest_sr ~mirror_vdi ~mirror_datapath
     )
     ()
 
-(** Switch destination VDI from readonly to writable mode *)
+(** Switch destination VDI to readonly mode (for snapshot mirroring) *)
+let switch_vdi_to_readonly ~dbg ~url ~verify_dest ~mirror_datapath ~dest_sr ~mirror_vdi ~mirror_vm =
+  let (module Remote) = Storage_migrate_helper.get_remote_backend url verify_dest in
+  D.debug "%s switching VDI %s to readonly" __FUNCTION__ (s_of_vdi mirror_vdi.vdi) ;
+  Remote.VDI.deactivate dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm ;
+  Remote.VDI.activate_readonly dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm
+
+(** Switch destination VDI to writable mode (for leaf mirroring) *)
 let switch_vdi_to_writable ~dbg ~url ~verify_dest ~mirror_datapath ~dest_sr ~mirror_vdi ~mirror_vm =
   let (module Remote) = Storage_migrate_helper.get_remote_backend url verify_dest in
   D.debug "%s switching VDI %s to writable" __FUNCTION__ (s_of_vdi mirror_vdi.vdi) ;
@@ -279,18 +264,14 @@ let mirror_single_snapshot ~dbg ~sr ~dest_sr ~url ~verify_dest ~mirror_vm ~copy_
 (** Process all snapshots in base-to-leaf order, preserving metadata *)
 let process_snapshots ~dbg ~sr ~dest_sr ~url ~verify_dest ~mirror_vm ~copy_vm
     ~mirror_vdi ~mirror_datapath ~nbd_uri ~snapshots =
-  if snapshots = [] then
-    []
-  else (
-    SXM.info "%s processing %d snapshot(s)" __FUNCTION__ (List.length snapshots) ;
-    List.mapi
-      (fun idx (snapshot_uuid, snapshot_time) ->
-        mirror_single_snapshot ~dbg ~sr ~dest_sr ~url ~verify_dest
-          ~mirror_vm ~copy_vm ~mirror_vdi ~mirror_datapath ~nbd_uri
-          ~idx ~total:(List.length snapshots) ~snapshot_uuid ~snapshot_time
-      )
-      snapshots
-  )
+  let total = List.length snapshots in
+  List.mapi
+    (fun idx (snapshot_uuid, snapshot_time) ->
+      mirror_single_snapshot ~dbg ~sr ~dest_sr ~url ~verify_dest
+        ~mirror_vm ~copy_vm ~mirror_vdi ~mirror_datapath ~nbd_uri
+        ~idx ~total ~snapshot_uuid ~snapshot_time
+    )
+    snapshots
 
 module MIRROR : SMAPIv2_MIRROR = struct
   type context = unit
@@ -308,9 +289,6 @@ module MIRROR : SMAPIv2_MIRROR = struct
        activating the VDI again on dom 0 when it is already activated on the live_vm.
        This means that if the VM shutsdown while SXM is in progress the
        mirroring for SMAPIv3 will fail.*)
-    
-    (* Track snapshot mappings created during mirroring *)
-    let snapshot_mappings = ref [] in
     
     (* Get snapshot chain for migration *)
     let snapshot_chain = get_snapshot_chain ~dbg ~vdi in
@@ -336,20 +314,27 @@ module MIRROR : SMAPIv2_MIRROR = struct
             ()
           |> Uri.to_string
         in
-        (* Mirror snapshots and switch VDI to writable mode *)
-        let mappings =
-          process_snapshots ~dbg ~sr ~dest_sr ~url ~verify_dest
-            ~mirror_vm ~copy_vm ~mirror_vdi ~mirror_datapath ~nbd_uri
-            ~snapshots:snapshot_chain
+        (* The dest VDI starts writable from receive_start3.
+           If there are snapshots, switch to readonly for snapshot mirroring,
+           mirror each snapshot, then switch back to writable for the leaf.
+           If no snapshots, the dest VDI is already writable — proceed directly. *)
+        let snapshot_mappings =
+          if snapshot_chain <> [] then (
+            switch_vdi_to_readonly ~dbg ~url ~verify_dest ~mirror_datapath
+              ~dest_sr ~mirror_vdi ~mirror_vm ;
+            let mappings =
+              process_snapshots ~dbg ~sr ~dest_sr ~url ~verify_dest
+                ~mirror_vm ~copy_vm ~mirror_vdi ~mirror_datapath ~nbd_uri
+                ~snapshots:snapshot_chain
+            in
+            SXM.info "%s %d snapshot(s) mirrored successfully" __FUNCTION__
+              (List.length mappings) ;
+            switch_vdi_to_writable ~dbg ~url ~verify_dest ~mirror_datapath
+              ~dest_sr ~mirror_vdi ~mirror_vm ;
+            mappings
+          ) else
+            []
         in
-        snapshot_mappings := mappings ;
-        
-        if mappings <> [] then
-          SXM.info "%s %d snapshot(s) mirrored successfully" __FUNCTION__
-            (List.length mappings) ;
-        
-        switch_vdi_to_writable ~dbg ~url ~verify_dest ~mirror_datapath
-          ~dest_sr ~mirror_vdi ~mirror_vm ;
         
         (* Start NBD proxy for leaf mirror *)
         D.debug "%s starting NBD proxy for leaf mirror" __FUNCTION__ ;
@@ -381,13 +366,14 @@ module MIRROR : SMAPIv2_MIRROR = struct
         State.add mirror_id (State.Send_op alm) ;
         D.debug "%s Updated mirror_id %s in the active local mirror"
           __FUNCTION__ mirror_id ;
-        mirror_wait ~dbg ~sr ~vdi ~vm:live_vm ~mirror_id mk ;
+        wait_for_mirror ~dbg ~sr ~vdi ~vm:live_vm ~mirror_id
+          ~error_msg:"Leaf VDI mirror failed during syncing" mk ;
         
         (* Store snapshot mappings for retrieval by xapi_vm_migrate *)
-        if !snapshot_mappings <> [] then (
+        if snapshot_mappings <> [] then (
           D.debug "%s storing %d snapshot mapping(s) for mirror %s" __FUNCTION__
-            (List.length !snapshot_mappings) mirror_id ;
-          State.set_snapshot_mappings mirror_id !snapshot_mappings
+            (List.length snapshot_mappings) mirror_id ;
+          State.set_snapshot_mappings mirror_id snapshot_mappings
         )
       with e ->
         D.error "%s caught exception during mirror: %s" __FUNCTION__
@@ -436,15 +422,15 @@ module MIRROR : SMAPIv2_MIRROR = struct
         | Some export ->
             export
       in
-      D.debug "%s activating (readonly) dp %s sr: %s vdi: %s vm: %s" __FUNCTION__ leaf_dp
+      D.debug "%s activating dp %s sr: %s vdi: %s vm: %s" __FUNCTION__ leaf_dp
         (s_of_sr sr) (s_of_vdi leaf.vdi) (s_of_vm vm) ;
-      Remote.VDI.activate_readonly dbg leaf_dp sr leaf.vdi vm ;
+      Remote.VDI.activate3 dbg leaf_dp sr leaf.vdi vm ;
       let qcow2_res =
         {Mirror.mirror_vdi= leaf; mirror_datapath= leaf_dp; nbd_export}
       in
       let remote_mirror = Mirror.SMAPIv3_mirror qcow2_res in
       D.debug
-        "%s updating receiving state lcoally to id: %s vm: %s vdi_info: %s"
+        "%s updating receiving state locally to id: %s vm: %s vdi_info: %s"
         __FUNCTION__ mirror_id (s_of_vm vm)
         (string_of_vdi_info vdi_info) ;
       State.add mirror_id
