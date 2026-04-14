@@ -382,10 +382,10 @@ module Mux = struct
                 ~value:true ;
               (* Also update storage backend metadata so SR.scan doesn't overwrite
                  with stale data from custom keys *)
-              let module C = StorageAPI (Idl.Exn.GenClient (struct
-                let rpc = of_sr sr
-              end)) in
               (try
+                let module C = StorageAPI (Idl.Exn.GenClient (struct
+                  let rpc = of_sr sr
+                end)) in
                 C.VDI.set_snapshot_metadata (Debug_info.to_string _di) sr
                   snapshot leaf snapshot_time true
               with e ->
@@ -448,10 +448,10 @@ module Mux = struct
                 ~is_a_snapshot:true ;
               (* Also update storage backend metadata so SR.scan doesn't overwrite
                  with stale data from custom keys *)
-              let module C = StorageAPI (Idl.Exn.GenClient (struct
-                let rpc = of_sr sr
-              end)) in
               (try
+                let module C = StorageAPI (Idl.Exn.GenClient (struct
+                  let rpc = of_sr sr
+                end)) in
                 C.VDI.set_snapshot_metadata (Debug_info.to_string _di) sr local_snapshot 
                   vdi src_snapshot_info.snapshot_time true
               with e ->
