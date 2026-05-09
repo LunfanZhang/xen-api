@@ -1344,6 +1344,10 @@ module VDIImpl (M : META) = struct
         Volume_client.unset (volume_rpc ~dbg ?missing) dbg sr vdi key
     )
 
+  (* Three individual key-sets with no transaction: a failure mid-way leaves
+     partial state. This matches the existing pattern for other multi-key
+     operations in this module; the XAPI DB (updated by set_snapshot_relations)
+     is the authoritative source and takes precedence on SR.scan reconciliation. *)
   let set_snapshot_metadata ~dbg ~sr ~vdi ~snapshot_of ~snapshot_time ~is_a_snapshot =
     let vdi_str = Storage_interface.Vdi.string_of vdi in
     let snapshot_of_str = Storage_interface.Vdi.string_of snapshot_of in
@@ -1796,8 +1800,11 @@ end
 module DATAImpl (M : META) = struct
   module VDI = VDIImpl (M)
 
-  (* Lightweight cache to avoid repeated Volume.stat calls during mirror polling.
-     Cache VDI.stat responses keyed by (SR, VDI). Populated by mirror, used by stat. *)
+  (* Cache VDI.stat (volume metadata) responses during mirror polling to avoid
+     repeated Volume.stat RPC calls. Populated by [mirror] at mirror start;
+     consumed by [stat] on cache hit; evicted when the mirror completes or fails.
+     Thread safety: this module runs in a cooperative async (Lwt) context, so
+     the hashtable does not need a mutex. *)
   let vdi_stat_cache = Hashtbl.create 16
 
   let stat dbg sr vdi' _vm key =

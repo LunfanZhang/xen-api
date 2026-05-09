@@ -364,8 +364,22 @@ module Mux = struct
           Db.VDI.set_snapshot_of ~__context ~self:vdi ~value:snapshot_of
       )
 
+    (** Best-effort: persist snapshot metadata to the storage backend so that
+        SR.scan cannot overwrite XAPI DB fields with stale values from volume
+        custom keys. Errors are logged and swallowed — the XAPI DB is the
+        authoritative source and has already been updated by the caller. *)
+    let update_backend_snapshot_metadata ~dbg sr snapshot leaf snapshot_time =
+      try
+        let module C = StorageAPI (Idl.Exn.GenClient (struct
+          let rpc = of_sr sr
+        end)) in
+        C.VDI.set_snapshot_metadata dbg sr snapshot leaf snapshot_time true
+      with e ->
+        debug "set_snapshot_metadata for %s on backend: %s (ignored)"
+          (s_of_vdi snapshot) (Printexc.to_string e)
+
     let set_snapshot_relations () ~dbg ~sr ~relations =
-      with_dbg ~name:"SR.set_snapshot_relations" ~dbg @@ fun _di ->
+      with_dbg ~name:"SR.set_snapshot_relations" ~dbg @@ fun di ->
       debug "SR.set_snapshot_relations dbg:%s sr:%s relations:%d"
         dbg (s_of_sr sr) (List.length relations) ;
       Server_helpers.exec_with_new_task "SR.set_snapshot_relations"
@@ -374,24 +388,11 @@ module Mux = struct
             (fun (snapshot, leaf, snapshot_time) ->
               let snapshot_ref, _ = find_vdi ~__context sr snapshot in
               let leaf_ref, _ = find_vdi ~__context sr leaf in
-              set_snapshot_time __context ~dbg ~sr ~vdi:snapshot
-                ~snapshot_time ;
-              Db.VDI.set_snapshot_of ~__context ~self:snapshot_ref
-                ~value:leaf_ref ;
-              Db.VDI.set_is_a_snapshot ~__context ~self:snapshot_ref
-                ~value:true ;
-              (* Also update storage backend metadata so SR.scan doesn't overwrite
-                 with stale data from custom keys *)
-              (try
-                let module C = StorageAPI (Idl.Exn.GenClient (struct
-                  let rpc = of_sr sr
-                end)) in
-                C.VDI.set_snapshot_metadata (Debug_info.to_string _di) sr
-                  snapshot leaf snapshot_time true
-              with e ->
-                debug "Failed to update snapshot metadata in storage backend for %s: %s"
-                  (s_of_vdi snapshot) (Printexc.to_string e)
-              )
+              set_snapshot_time __context ~dbg ~sr ~vdi:snapshot ~snapshot_time ;
+              Db.VDI.set_snapshot_of ~__context ~self:snapshot_ref ~value:leaf_ref ;
+              Db.VDI.set_is_a_snapshot ~__context ~self:snapshot_ref ~value:true ;
+              update_backend_snapshot_metadata
+                ~dbg:(Debug_info.to_string di) sr snapshot leaf snapshot_time
             )
             relations
         )
@@ -446,18 +447,8 @@ module Mux = struct
                 ~snapshot_of:vdi ;
               set_is_a_snapshot __context ~dbg ~sr ~vdi:local_snapshot
                 ~is_a_snapshot:true ;
-              (* Also update storage backend metadata so SR.scan doesn't overwrite
-                 with stale data from custom keys *)
-              (try
-                let module C = StorageAPI (Idl.Exn.GenClient (struct
-                  let rpc = of_sr sr
-                end)) in
-                C.VDI.set_snapshot_metadata (Debug_info.to_string _di) sr local_snapshot 
-                  vdi src_snapshot_info.snapshot_time true
-              with e ->
-                debug "Failed to update snapshot metadata in storage backend for %s: %s"
-                  (s_of_vdi local_snapshot) (Printexc.to_string e)
-              )
+              update_backend_snapshot_metadata ~dbg:(Debug_info.to_string _di)
+                sr local_snapshot vdi src_snapshot_info.snapshot_time
             )
             snapshot_pairs
       )

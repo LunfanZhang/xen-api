@@ -1129,41 +1129,43 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
       else
         raise e
   in
-  (* Helper: retrieve snapshot mappings from migration state *)
-  let get_snapshot_mappings mirror_id =
+  let get_snapshot_relations mirror_id =
     match mirror_id with
     | Some mid ->
-        let mappings = Storage_migrate_helper.State.get_snapshot_mappings mid in
-        if mappings <> [] then
-          debug "retrieved %d snapshot mapping(s) for mirror %s"
-            (List.length mappings) mid ;
-        mappings
+        let relations = Storage_migrate_helper.State.get_snapshot_mappings mid in
+        if relations <> [] then
+          debug "retrieved %d snapshot relation(s) for mirror %s"
+            (List.length relations) mid ;
+        relations
     | None ->
         []
   in
-  (* Helper: set snapshot relationships on destination SR *)
-  let set_snapshot_relations ~dest_sr ~leaf_vdi snapshot_mappings =
-    let relations =
-      List.map (fun (_src, dest, snapshot_time) ->
-        (* Convert flat tuple to RPC nested pair format *)
-        (dest, (leaf_vdi, snapshot_time))
-      ) snapshot_mappings
-    in
+  let call_set_snapshot_relations ~dest_sr ~leaf_vdi relations =
     match relations with
     | [] ->
         ()
     | _ ->
-        debug "setting %d snapshot relation(s) on SR %s" (List.length relations)
+        debug "setting %d snapshot relation(s) on SR %s"
+          (List.length relations)
           (Storage_interface.Sr.string_of dest_sr) ;
-        try SMAPI.SR.set_snapshot_relations dbg dest_sr relations
-        with e ->
-          warn "failed to set snapshot relations on SR %s: %s"
-            (Storage_interface.Sr.string_of dest_sr) (Printexc.to_string e)
+        (* TypeCombinators encodes the relation list as nested pairs on the wire *)
+        let rpc_pairs =
+          List.map
+            (fun (r : Storage_migrate_helper.State.snapshot_relation) ->
+              (r.dest_vdi, (leaf_vdi, r.snapshot_time))
+            )
+            relations
+        in
+        (try SMAPI.SR.set_snapshot_relations dbg dest_sr rpc_pairs
+         with e ->
+           warn "failed to set snapshot relations on SR %s: %s"
+             (Storage_interface.Sr.string_of dest_sr) (Printexc.to_string e)
+        )
   in
-  (* Helper: create mirror record for a snapshot VDI *)
-  let create_snapshot_mirror_record (src_vdi, dest_vdi, _snapshot_time) =
-    let src_uuid = Storage_interface.Vdi.string_of src_vdi in
-    let dest_uuid = Storage_interface.Vdi.string_of dest_vdi in
+  let create_snapshot_mirror_record
+      (r : Storage_migrate_helper.State.snapshot_relation) =
+    let src_uuid = Storage_interface.Vdi.string_of r.src_vdi in
+    let dest_uuid = Storage_interface.Vdi.string_of r.dest_vdi in
     try
       let src_ref = Db.VDI.get_by_uuid ~__context ~uuid:src_uuid in
       let dest_ref =
@@ -1175,13 +1177,13 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
           mr_dp= None
         ; mr_mirrored= false
         ; mr_local_sr= vconf.sr
-        ; mr_local_vdi= src_vdi
+        ; mr_local_vdi= r.src_vdi
         ; mr_remote_sr= dest_sr
-        ; mr_remote_vdi= dest_vdi
+        ; mr_remote_vdi= r.dest_vdi
         ; mr_local_xenops_locator=
             Xapi_xenops.xenops_vdi_locator ~__context ~self:src_ref
         ; mr_remote_xenops_locator=
-            Xapi_xenops.xenops_vdi_locator_of dest_sr dest_vdi
+            Xapi_xenops.xenops_vdi_locator_of dest_sr r.dest_vdi
         ; mr_local_vdi_reference= src_ref
         ; mr_remote_vdi_reference= dest_ref
         }
@@ -1197,11 +1199,11 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
             let mirror_record =
               get_mirror_record ~new_dp remote_vdi remote_vdi_ref
             in
-            let snapshot_mappings = get_snapshot_mappings mirror_id in
-            set_snapshot_relations ~dest_sr ~leaf_vdi:remote_vdi
-              snapshot_mappings ;
+            let snapshot_relations = get_snapshot_relations mirror_id in
+            call_set_snapshot_relations ~dest_sr ~leaf_vdi:remote_vdi
+              snapshot_relations ;
             let snapshot_mirror_records =
-              List.filter_map create_snapshot_mirror_record snapshot_mappings
+              List.filter_map create_snapshot_mirror_record snapshot_relations
             in
             let result = post_mirror mirror_id mirror_record in
             List.iter (fun mr -> ignore (continuation mr)) snapshot_mirror_records ;

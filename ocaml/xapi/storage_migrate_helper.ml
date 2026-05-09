@@ -315,19 +315,22 @@ module State = struct
     | _ ->
         failwith "Bad id"
 
-  (* Snapshot mappings storage for SMAPIv3 migrations.
-     Maps mirror_id -> list of (source_snapshot_vdi, dest_snapshot_vdi, snapshot_time) tuples.
-     This allows snapshot VMs' VBDs to be correctly updated and snapshot metadata preserved
-     after mirroring. The snapshot_time is in ISO8601 format. *)
-  type snapshot_mappings_table =
-    (string, (Storage_interface.Vdi.t * Storage_interface.Vdi.t * string) list)
-    Hashtbl.t
+  (** A single (source → destination) snapshot pairing recorded during SMAPIv3
+      live migration. Used after mirroring to update VBD references and restore
+      snapshot metadata on the destination. [snapshot_time] is ISO8601. *)
+  type snapshot_relation = {
+    src_vdi: Storage_interface.Vdi.t
+  ; dest_vdi: Storage_interface.Vdi.t
+  ; snapshot_time: string
+  }
+
+  type snapshot_mappings_table = (string, snapshot_relation list) Hashtbl.t
 
   let snapshot_mappings : snapshot_mappings_table = Hashtbl.create 10
 
-  let set_snapshot_mappings mirror_id mappings =
+  let set_snapshot_mappings mirror_id relations =
     Xapi_stdext_threads.Threadext.Mutex.execute mutex (fun () ->
-        Hashtbl.replace snapshot_mappings mirror_id mappings
+        Hashtbl.replace snapshot_mappings mirror_id relations
     )
 
   let get_snapshot_mappings mirror_id =
