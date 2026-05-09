@@ -174,15 +174,18 @@ let mirror_snapshot_into_existing_dest ~dbg ~sr ~snapshot_vdi_uuid ~dest_sr
     (try detach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm with _ -> ()) ;
     raise e
 
-(** Helper to extract NBD export name from backend attach info *)
+(** Extract NBD export name from backend attach info, or raise if unavailable. *)
 let nbd_export_of_attach_info backend =
   let _, _, _, nbds = Storage_interface.implementations_of_backend backend in
   match nbds with
-  | [] ->
-      None
   | nbd :: _ ->
       let _socket, export = Storage_interface.parse_nbd_uri nbd in
-      Some export
+      export
+  | [] ->
+      raise
+        (Storage_error
+           (Migration_preparation_failure "No NBD export found in attach info")
+        )
 
 (** A node in the VM snapshot tree, projected onto a single disk.
     Correctly represents branching caused by revert operations.
@@ -336,7 +339,14 @@ let get_snapshot_tree ~dbg ~vdi =
   with e ->
     D.error "%s failed to retrieve snapshot tree: %s" __FUNCTION__
       (Printexc.to_string e) ;
-    []
+    raise
+      (Storage_error
+         (Migration_preparation_failure
+            (Printf.sprintf "Failed to build snapshot tree for VDI %s: %s"
+               (s_of_vdi vdi) (Printexc.to_string e)
+            )
+         )
+      )
 
 (** Start NBD proxy thread for remote mirroring *)
 let start_nbd_proxy_thread ~url ~mirror_vm ~dest_sr ~mirror_vdi ~mirror_datapath ~verify_dest =
@@ -361,90 +371,108 @@ let switch_vdi_to_writable ~dbg ~url ~verify_dest ~mirror_datapath ~dest_sr ~mir
   Remote.VDI.deactivate dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm ;
   Remote.VDI.activate3 dbg mirror_datapath dest_sr mirror_vdi.vdi mirror_vm
 
-(** Recursively process a snapshot tree node. Mirrors the node's VDI data
-    into [dest_vdi], snapshots it, then processes children. Active-path
-    children continue on the same [dest_vdi]; side-branch children receive
-    a VDI.clone of the snapshot, preserving the source storage-layer tree
-    structure on the destination. This is one unified logic for all branches. *)
-let rec process_snapshot_node ~dbg ~sr ~dest_sr ~url ~verify_dest
-    ~mirror_vm ~copy_vm ~dest_vdi ~dest_dp ~nbd_uri ~nbd_proxy_path
-    ~counter ~total node =
+(** Invariant context shared across all nodes in a snapshot tree traversal.
+    Extracted to avoid threading 8+ parameters through every recursive call. *)
+type mirror_ctx = {
+  dbg: string
+; sr: Sr.t
+; dest_sr: Sr.t
+; url: string
+; verify_dest: bool
+; mirror_vm: Vm.t
+; copy_vm: Vm.t
+; nbd_proxy_path: string
+}
+
+(** Make a NBD URI pointing at the local proxy socket for [export]. *)
+let nbd_uri_of_export ~nbd_proxy_path export =
+  Uri.make ~scheme:"nbd+unix" ~host:"" ~path:export
+    ~query:[("socket", [nbd_proxy_path])]
+    ()
+  |> Uri.to_string
+
+(** Prepare a branch VDI by cloning [snapshot] on the destination, attaching
+    it readonly, and returning the VDI info, datapath, NBD URI and a cleanup
+    thunk. The cleanup must be called after the child subtree is processed. *)
+let prepare_branch_vdi ~ctx ~dest_snapshot =
   let (module Remote) =
-    Storage_migrate_helper.get_remote_backend url verify_dest
+    Storage_migrate_helper.get_remote_backend ctx.url ctx.verify_dest
   in
+  let bv = Remote.VDI.clone ctx.dbg ctx.dest_sr dest_snapshot in
+  let bdp = Uuidx.(to_string (make ())) in
+  D.debug "%s branch VDI %s cloned from snapshot %s" __FUNCTION__
+    (s_of_vdi bv.vdi) (s_of_vdi dest_snapshot.vdi) ;
+  let backend =
+    Remote.VDI.attach3 ctx.dbg bdp ctx.dest_sr bv.vdi ctx.mirror_vm true
+  in
+  Remote.VDI.activate_readonly ctx.dbg bdp ctx.dest_sr bv.vdi ctx.mirror_vm ;
+  let nbd_uri =
+    nbd_uri_of_export ~nbd_proxy_path:ctx.nbd_proxy_path
+      (nbd_export_of_attach_info backend)
+  in
+  let cleanup () =
+    D.debug "%s cleaning up branch VDI %s" __FUNCTION__ (s_of_vdi bv.vdi) ;
+    (try Remote.VDI.deactivate ctx.dbg bdp ctx.dest_sr bv.vdi ctx.mirror_vm
+     with _ -> ()
+    ) ;
+    (try Remote.VDI.detach ctx.dbg bdp ctx.dest_sr bv.vdi ctx.mirror_vm
+     with _ -> ()
+    ) ;
+    (try Remote.VDI.destroy ctx.dbg ctx.dest_sr bv.vdi with _ -> ())
+  in
+  (bv, bdp, nbd_uri, cleanup)
+
+(** Recursively mirror a snapshot tree node into [dest_vdi], then recurse
+    into children. Active-path children reuse the same [dest_vdi] (they
+    continue the main chain); side-branch children receive a VDI.clone of
+    the snapshot so the storage-layer branching is preserved on the
+    destination. Returns accumulated [snapshot_relation] mappings. *)
+let rec process_snapshot_node ~ctx ~dest_vdi ~dest_dp ~nbd_uri ~counter ~total
+    node =
   incr counter ;
-  SXM.info "%s [%d/%d] mirroring snapshot %s into %s" __FUNCTION__
-    !counter total node.vdi_uuid (s_of_vdi dest_vdi.vdi) ;
-  (* Mirror this node's VDI data into dest_vdi, then snapshot to preserve *)
+  SXM.info "%s [%d/%d] mirroring snapshot %s into %s" __FUNCTION__ !counter
+    total node.vdi_uuid (s_of_vdi dest_vdi.vdi) ;
+  (* Give the NBD proxy thread time to start listening before issuing the
+     mirror RPC. A proper fix would use a Mutex+Condition for readiness
+     signalling — tracked as a follow-up. *)
   let _ : Thread.t =
-    start_nbd_proxy_thread ~url ~mirror_vm ~dest_sr
-      ~mirror_vdi:dest_vdi ~mirror_datapath:dest_dp ~verify_dest
+    start_nbd_proxy_thread ~url:ctx.url ~mirror_vm:ctx.mirror_vm
+      ~dest_sr:ctx.dest_sr ~mirror_vdi:dest_vdi ~mirror_datapath:dest_dp
+      ~verify_dest:ctx.verify_dest
   in
   Unix.sleepf mirror_poll_interval ;
   let dest_snapshot =
-    mirror_snapshot_into_existing_dest ~dbg ~sr
-      ~snapshot_vdi_uuid:node.vdi_uuid ~dest_sr ~dest_url:url ~verify_dest
-      ~mirror_vm ~copy_vm ~dest_vdi_info:dest_vdi ~nbd_uri
+    mirror_snapshot_into_existing_dest ~dbg:ctx.dbg ~sr:ctx.sr
+      ~snapshot_vdi_uuid:node.vdi_uuid ~dest_sr:ctx.dest_sr ~dest_url:ctx.url
+      ~verify_dest:ctx.verify_dest ~mirror_vm:ctx.mirror_vm
+      ~copy_vm:ctx.copy_vm ~dest_vdi_info:dest_vdi ~nbd_uri
   in
-  let this_mapping =
-    (Vdi.of_string node.vdi_uuid, dest_snapshot.vdi, node.snapshot_time)
+  let this_relation =
+    State.
+      { src_vdi= Vdi.of_string node.vdi_uuid
+      ; dest_vdi= dest_snapshot.vdi
+      ; snapshot_time= node.snapshot_time
+      }
   in
-  (* Process children with unified logic — only VDI setup differs *)
-  let child_mappings =
-    List.concat
-      (List.map
-         (fun child ->
-           let child_vdi, child_dp, child_nbd_uri, cleanup =
-             if child.on_active_path then
-               (dest_vdi, dest_dp, nbd_uri, fun () -> ())
-             else
-               (* Branch point: clone the snapshot to fork the storage chain *)
-               let bv = Remote.VDI.clone dbg dest_sr dest_snapshot in
-               let bdp = Uuidx.(to_string (make ())) in
-               D.debug "%s branch VDI %s cloned from snapshot %s"
-                 __FUNCTION__ (s_of_vdi bv.vdi) (s_of_vdi dest_snapshot.vdi) ;
-               let backend =
-                 Remote.VDI.attach3 dbg bdp dest_sr bv.vdi mirror_vm true
-               in
-               Remote.VDI.activate_readonly dbg bdp dest_sr bv.vdi mirror_vm ;
-               let bne =
-                 match nbd_export_of_attach_info backend with
-                 | Some e ->
-                     e
-                 | None ->
-                     failwith "Cannot parse NBD export for branch VDI"
-               in
-               let bnu =
-                 Uri.make ~scheme:"nbd+unix" ~host:"" ~path:bne
-                   ~query:[("socket", [nbd_proxy_path])]
-                   ()
-                 |> Uri.to_string
-               in
-               let cleanup () =
-                 D.debug "%s cleaning up branch VDI %s" __FUNCTION__
-                   (s_of_vdi bv.vdi) ;
-                 (try Remote.VDI.deactivate dbg bdp dest_sr bv.vdi mirror_vm
-                  with _ -> ()
-                 ) ;
-                 (try Remote.VDI.detach dbg bdp dest_sr bv.vdi mirror_vm
-                  with _ -> ()
-                 ) ;
-                 (try Remote.VDI.destroy dbg dest_sr bv.vdi with _ -> ())
-               in
-               (bv, bdp, bnu, cleanup)
-           in
-           let mappings =
-             process_snapshot_node ~dbg ~sr ~dest_sr ~url ~verify_dest
-               ~mirror_vm ~copy_vm ~dest_vdi:child_vdi ~dest_dp:child_dp
-               ~nbd_uri:child_nbd_uri ~nbd_proxy_path ~counter ~total child
-           in
-           cleanup () ;
-           mappings
-         )
-         node.children
+  let child_relations =
+    List.concat_map
+      (fun child ->
+        let child_vdi, child_dp, child_nbd_uri, cleanup =
+          if child.on_active_path then
+            (dest_vdi, dest_dp, nbd_uri, Fun.id)
+          else
+            prepare_branch_vdi ~ctx ~dest_snapshot
+        in
+        let mappings =
+          process_snapshot_node ~ctx ~dest_vdi:child_vdi ~dest_dp:child_dp
+            ~nbd_uri:child_nbd_uri ~counter ~total child
+        in
+        cleanup () ;
+        mappings
       )
+      node.children
   in
-  this_mapping :: child_mappings
+  this_relation :: child_relations
 
 module MIRROR : SMAPIv2_MIRROR = struct
   type context = unit
@@ -479,57 +507,49 @@ module MIRROR : SMAPIv2_MIRROR = struct
              )
           )
     | Mirror.SMAPIv3_mirror {nbd_export; mirror_datapath; mirror_vdi} -> (
+      let nbd_proxy_path =
+        Printf.sprintf "/var/run/nbdproxy/export/%s" (Vm.string_of mirror_vm)
+      in
+      let nbd_uri = nbd_uri_of_export ~nbd_proxy_path nbd_export in
+      let ctx =
+        {dbg; sr; dest_sr; url; verify_dest; mirror_vm; copy_vm; nbd_proxy_path}
+      in
       try
-        let nbd_proxy_path =
-          Printf.sprintf "/var/run/nbdproxy/export/%s" (Vm.string_of mirror_vm)
-        in
-        let nbd_uri =
-          Uri.make ~scheme:"nbd+unix" ~host:"" ~path:nbd_export
-            ~query:[("socket", [nbd_proxy_path])]
-            ()
-          |> Uri.to_string
-        in
         (* The dest VDI starts writable from receive_start3.
            If there are snapshots, switch to readonly for snapshot mirroring,
            recursively process the tree (branching at revert points),
            then switch back to writable for the leaf.
            If no snapshots, the dest VDI is already writable — proceed directly. *)
-        let snapshot_mappings =
+        let snapshot_relations =
           if has_snapshots then (
             switch_vdi_to_readonly ~dbg ~url ~verify_dest ~mirror_datapath
               ~dest_sr ~mirror_vdi ~mirror_vm ;
             let total = count_tree_nodes snapshot_tree in
             let counter = ref 0 in
-            let mappings =
-              List.concat
-                (List.map
-                   (fun root ->
-                     process_snapshot_node ~dbg ~sr ~dest_sr ~url ~verify_dest
-                       ~mirror_vm ~copy_vm ~dest_vdi:mirror_vdi
-                       ~dest_dp:mirror_datapath ~nbd_uri ~nbd_proxy_path
-                       ~counter ~total root
-                   )
-                   snapshot_tree
+            let relations =
+              List.concat_map
+                (fun root ->
+                  process_snapshot_node ~ctx ~dest_vdi:mirror_vdi
+                    ~dest_dp:mirror_datapath ~nbd_uri ~counter ~total root
                 )
+                snapshot_tree
             in
             SXM.info "%s %d snapshot(s) mirrored successfully" __FUNCTION__
-              (List.length mappings) ;
+              (List.length relations) ;
             switch_vdi_to_writable ~dbg ~url ~verify_dest ~mirror_datapath
               ~dest_sr ~mirror_vdi ~mirror_vm ;
-            mappings
+            relations
           ) else
             []
         in
-        
-        (* Start NBD proxy for leaf mirror *)
         D.debug "%s starting NBD proxy for leaf mirror" __FUNCTION__ ;
-        let _ : Thread.t = start_nbd_proxy_thread ~url ~mirror_vm ~dest_sr
-          ~mirror_vdi ~mirror_datapath ~verify_dest in
-
+        let _ : Thread.t =
+          start_nbd_proxy_thread ~url ~mirror_vm ~dest_sr ~mirror_vdi
+            ~mirror_datapath ~verify_dest
+        in
         D.info "%s nbd_proxy_path: %s nbd_url %s" __FUNCTION__ nbd_proxy_path
           nbd_uri ;
         let mk = Local.DATA.mirror dbg sr vdi live_vm nbd_uri in
-
         D.debug "%s Updating active local mirrors: id=%s" __FUNCTION__ mirror_id ;
         let alm =
           State.Send_state.
@@ -553,20 +573,21 @@ module MIRROR : SMAPIv2_MIRROR = struct
           __FUNCTION__ mirror_id ;
         wait_for_mirror ~dbg ~sr ~vdi ~vm:live_vm ~mirror_id
           ~error_msg:"Leaf VDI mirror failed during syncing" mk ;
-        
-        (* Store snapshot mappings for retrieval by xapi_vm_migrate *)
-        if snapshot_mappings <> [] then (
-          D.debug "%s storing %d snapshot mapping(s) for mirror %s" __FUNCTION__
-            (List.length snapshot_mappings) mirror_id ;
-          State.set_snapshot_mappings mirror_id snapshot_mappings
+        if snapshot_relations <> [] then (
+          D.debug "%s storing %d snapshot relation(s) for mirror %s" __FUNCTION__
+            (List.length snapshot_relations) mirror_id ;
+          State.set_snapshot_mappings mirror_id snapshot_relations
         )
-      with e ->
-        D.error "%s caught exception during mirror: %s" __FUNCTION__
-          (Printexc.to_string e) ;
-        raise
-          (Storage_interface.Storage_error
-             (Migration_mirror_failure (Printexc.to_string e))
-          )
+      with
+      | Storage_interface.Storage_error _ as e ->
+          raise e
+      | e ->
+          D.error "%s caught exception during mirror: %s" __FUNCTION__
+            (Printexc.to_string e) ;
+          raise
+            (Storage_interface.Storage_error
+               (Migration_mirror_failure (Printexc.to_string e))
+            )
     )
 
   let receive_start _ctx ~dbg:_ ~sr:_ ~vdi_info:_ ~id:_ ~similar:_ =
@@ -597,16 +618,7 @@ module MIRROR : SMAPIv2_MIRROR = struct
       D.info "Created leaf VDI for mirror receive: %s" (string_of_vdi_info leaf) ;
       on_fail := (fun () -> Remote.VDI.destroy dbg sr leaf.vdi) :: !on_fail ;
       let backend = Remote.VDI.attach3 dbg leaf_dp sr leaf.vdi vm true in
-      let nbd_export =
-        match nbd_export_of_attach_info backend with
-        | None ->
-            raise
-              (Storage_error
-                 (Migration_preparation_failure "Cannot parse nbd uri")
-              )
-        | Some export ->
-            export
-      in
+      let nbd_export = nbd_export_of_attach_info backend in
       D.debug "%s activating dp %s sr: %s vdi: %s vm: %s" __FUNCTION__ leaf_dp
         (s_of_sr sr) (s_of_vdi leaf.vdi) (s_of_vm vm) ;
       Remote.VDI.activate3 dbg leaf_dp sr leaf.vdi vm ;

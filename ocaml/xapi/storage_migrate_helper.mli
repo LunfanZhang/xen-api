@@ -237,23 +237,18 @@ module State : sig
 
   val of_copy_id : string -> Storage_interface.sr * Storage_interface.vdi
 
-  (** [set_snapshot_mappings mirror_id mappings] stores snapshot VDI mappings
-      for a mirror operation. Each mapping is a tuple (src_vdi, dest_vdi, snapshot_time)
-      where snapshot_time is in ISO8601 format. Used during SMAPIv3 migrations to
-      track source and destination snapshot VDIs with their metadata. *)
-  val set_snapshot_mappings :
-       string
-    -> (Storage_interface.Vdi.t * Storage_interface.Vdi.t * string) list
-    -> unit
+  (** A single source→destination snapshot pairing recorded during SMAPIv3
+      live migration. [snapshot_time] is ISO8601. *)
+  type snapshot_relation = {
+    src_vdi: Storage_interface.Vdi.t
+  ; dest_vdi: Storage_interface.Vdi.t
+  ; snapshot_time: string
+  }
 
-  (** [get_snapshot_mappings mirror_id] retrieves stored snapshot VDI mappings
-      for a mirror operation. Returns a list of (src_vdi, dest_vdi, snapshot_time)
-      tuples, or empty list if no mappings exist. *)
-  val get_snapshot_mappings :
-    string -> (Storage_interface.Vdi.t * Storage_interface.Vdi.t * string) list
+  val set_snapshot_mappings : string -> snapshot_relation list -> unit
 
-  (** [remove_snapshot_mappings mirror_id] cleans up snapshot VDI mappings
-      after a mirror operation completes. *)
+  val get_snapshot_mappings : string -> snapshot_relation list
+
   val remove_snapshot_mappings : string -> unit
 end
 
