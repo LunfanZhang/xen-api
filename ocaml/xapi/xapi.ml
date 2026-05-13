@@ -519,6 +519,8 @@ let attempt_host_status_check_with_coordinator ~__context my_ip =
 let start_ha () =
   try Xapi_ha.on_server_restart ()
   with e ->
+    (* Try to clean slave_emergency_mode that on_server_restart may set *)
+    if Pool_role.is_master () then Xapi_globs.slave_emergency_mode := false ;
     (* Critical that we don't continue as a master and use shared resources *)
     debug "Caught exception starting HA system: %s" (ExnHelper.string_of_exn e)
 
