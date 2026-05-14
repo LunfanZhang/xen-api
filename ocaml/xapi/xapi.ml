@@ -159,20 +159,12 @@ let random_setup () =
   finally (fun () -> really_input chan s 0 n) (fun () -> close_in chan) ;
   Random.full_init (Array.init n (fun i -> Char.code (Bytes.get s i)))
 
-let fake_rpc2 req rpc =
-  let emergency_call =
-    List.mem rpc.Rpc.name Api_server_common.emergency_call_list
-  in
-  if !Xapi_globs.slave_emergency_mode && not emergency_call then
-    raise !Xapi_globs.emergency_mode_error ;
-  Api_server.Server.dispatch_call req None rpc
-
 let register_callback_fns () =
-  let fake_rpc req sock xml : Rpc.response =
-    Api_server.callback1 false req sock xml
+  let fake_rpc req fd_opt call : Rpc.response =
+    Api_server.callback1 false req fd_opt call
   in
-  Xapi_cli.rpc_fun := Some fake_rpc ;
-  Helpers.rpc_fun := Some fake_rpc2 ;
+  Xapi_cli.register_rpc_fun fake_rpc ;
+  Helpers.register_rpc_fun fake_rpc ;
   Message_forwarding.register_callback_fns ()
 
 let noevents = ref false
