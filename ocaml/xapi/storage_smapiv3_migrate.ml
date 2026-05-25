@@ -187,10 +187,13 @@ let nbd_export_of_attach_info backend =
            (Migration_preparation_failure "No NBD export found in attach info")
         )
 
-(** A node in the VM snapshot tree, projected onto a single disk.
-    Correctly represents branching caused by revert operations.
-    [on_active_path] indicates whether this node is on the path from
-    root to the active VM — used to decide VDI reuse vs clone. *)
+(** A node in the VM snapshot tree, projected onto a single disk position
+    (identified by VBD [userdevice]). Branching at a node means the source
+    VM was reverted to that snapshot before further snapshots were taken;
+    among the children exactly one lies on the active path (the chain
+    leading to the live VM) and the rest are reverted-and-orphaned
+    branches that still need to be reproduced on the destination so the
+    snapshot tree topology survives migration. *)
 type snapshot_tree_node = {
   vdi_uuid: string
 ; snapshot_time: string
@@ -201,46 +204,59 @@ type snapshot_tree_node = {
 (** Find the active (non-snapshot) VM that owns a given VDI via its VBDs. *)
 let find_active_vm_for_vdi ~__context ~vdi_ref =
   let vbds = Db.VDI.get_VBDs ~__context ~self:vdi_ref in
-  let active_vms =
-    List.filter_map
-      (fun vbd ->
-        try
-          let vm = Db.VBD.get_VM ~__context ~self:vbd in
-          if not (Db.VM.get_is_a_snapshot ~__context ~self:vm) then
-            Some vm
-          else
-            None
-        with _ -> None
-      )
-      vbds
-  in
-  match active_vms with vm :: _ -> Some vm | [] -> None
+  List.find_map
+    (fun vbd ->
+      try
+        let vm = Db.VBD.get_VM ~__context ~self:vbd in
+        if Db.VM.get_is_a_snapshot ~__context ~self:vm then None else Some vm
+      with _ -> None
+    )
+    vbds
 
-(** For a snapshot VM, find the VDI corresponding to a specific disk
-    (identified by [leaf_vdi_ref] via snapshot_of). *)
-let find_snapshot_vdi_for_disk ~__context ~leaf_vdi_ref ~snapshot_vm =
+(** Find the [userdevice] of the VBD on [vm] that points at [vdi_ref].
+    [userdevice] identifies the disk slot within the VM and is the
+    correct cross-snapshot identity for a disk: it is preserved across
+    revert operations, whereas a snapshot's [snapshot_of] points at the
+    pre-revert active VDI ref which may no longer exist. *)
+let find_userdevice_for_vdi ~__context ~vm ~vdi_ref =
+  let vbds = Db.VM.get_VBDs ~__context ~self:vm in
+  List.find_map
+    (fun vbd ->
+      try
+        if
+          Db.VBD.get_type ~__context ~self:vbd = `Disk
+          && Db.VBD.get_VDI ~__context ~self:vbd = vdi_ref
+        then
+          Some (Db.VBD.get_userdevice ~__context ~self:vbd)
+        else
+          None
+      with _ -> None
+    )
+    vbds
+
+(** For a snapshot VM, find the snapshot VDI sitting in the disk slot
+    identified by [userdevice]. Returns [(uuid, snapshot_time)] or
+    [None] if no disk VBD with that userdevice exists on this snapshot. *)
+let find_snapshot_vdi_by_userdevice ~__context ~userdevice ~snapshot_vm =
   let vbds = Db.VM.get_VBDs ~__context ~self:snapshot_vm in
-  let matches =
-    List.filter_map
-      (fun vbd ->
-        try
-          if Db.VBD.get_type ~__context ~self:vbd <> `Disk then
-            None
-          else
-            let vdi = Db.VBD.get_VDI ~__context ~self:vbd in
-            if Db.VDI.get_snapshot_of ~__context ~self:vdi = leaf_vdi_ref then
-              let uuid = Db.VDI.get_uuid ~__context ~self:vdi in
-              let time =
-                Date.to_rfc3339 (Db.VDI.get_snapshot_time ~__context ~self:vdi)
-              in
-              Some (uuid, time)
-            else
-              None
-        with _ -> None
-      )
-      vbds
-  in
-  match matches with entry :: _ -> Some entry | [] -> None
+  List.find_map
+    (fun vbd ->
+      try
+        if
+          Db.VBD.get_type ~__context ~self:vbd = `Disk
+          && Db.VBD.get_userdevice ~__context ~self:vbd = userdevice
+        then
+          let vdi = Db.VBD.get_VDI ~__context ~self:vbd in
+          let uuid = Db.VDI.get_uuid ~__context ~self:vdi in
+          let time =
+            Date.to_rfc3339 (Db.VDI.get_snapshot_time ~__context ~self:vdi)
+          in
+          Some (uuid, time)
+        else
+          None
+      with _ -> None
+    )
+    vbds
 
 (** Sort snapshot VMs by snapshot_time ascending (oldest first). *)
 let sort_snapshots_by_time ~__context snaps =
@@ -252,26 +268,47 @@ let sort_snapshots_by_time ~__context snaps =
     )
     snaps
 
-(** Build a snapshot subtree rooted at [snapshot_vm] for a given disk. *)
-let rec build_snapshot_subtree ~__context ~leaf_vdi_ref ~active_path
+(** Walk the [parent] chain upward from [vm] to collect the set of
+    snapshot VMs on the active path (the chronological line from the
+    oldest root snapshot down to [vm]). The result is a set membership
+    predicate, returned as a [Ref.t -> bool]. *)
+let build_active_path_predicate ~__context ~vm =
+  let rec collect snap acc =
+    if snap = Ref.null then acc
+    else collect (Db.VM.get_parent ~__context ~self:snap) (snap :: acc)
+  in
+  let path = collect (Db.VM.get_parent ~__context ~self:vm) [] in
+  fun snap -> List.mem snap path
+
+(** Build the snapshot subtree rooted at [snapshot_vm], projected onto a
+    single disk identified by [userdevice]. A node whose snapshot VM has
+    no VBD matching [userdevice] is skipped: its descendants (if any
+    match) are promoted to take its place, so we never lose snapshots
+    that exist for the disk just because an intermediate snapshot VM did
+    not include it. *)
+let rec build_subtree_for_userdevice ~__context ~userdevice ~on_active_path
     snapshot_vm =
-  match find_snapshot_vdi_for_disk ~__context ~leaf_vdi_ref ~snapshot_vm with
-  | None ->
-      None
+  let recur_children () =
+    Db.VM.get_children ~__context ~self:snapshot_vm
+    |> List.filter (fun c -> Db.VM.get_is_a_snapshot ~__context ~self:c)
+    |> sort_snapshots_by_time ~__context
+    |> List.concat_map
+         (build_subtree_for_userdevice ~__context ~userdevice ~on_active_path)
+  in
+  match
+    find_snapshot_vdi_by_userdevice ~__context ~userdevice ~snapshot_vm
+  with
   | Some (vdi_uuid, snapshot_time) ->
-      let snapshot_children =
-        Db.VM.get_children ~__context ~self:snapshot_vm
-        |> List.filter (fun c -> Db.VM.get_is_a_snapshot ~__context ~self:c)
-        |> sort_snapshots_by_time ~__context
-        |> List.filter_map
-             (build_snapshot_subtree ~__context ~leaf_vdi_ref ~active_path)
-      in
-      Some
-        { vdi_uuid
+      [ { vdi_uuid
         ; snapshot_time
-        ; on_active_path= List.mem snapshot_vm active_path
-        ; children= snapshot_children
-        }
+        ; on_active_path= on_active_path snapshot_vm
+        ; children= recur_children ()
+        } ]
+  | None ->
+      (* Promote descendants: a snapshot VM without this disk is a
+         transparent intermediate — its disk-bearing descendants must
+         still appear in the tree at the parent's level. *)
+      recur_children ()
 
 (** Count total nodes in a list of snapshot trees. *)
 let rec count_tree_nodes trees =
@@ -279,9 +316,13 @@ let rec count_tree_nodes trees =
     (fun acc node -> acc + 1 + count_tree_nodes node.children)
     0 trees
 
-(** Retrieve the snapshot tree for a VDI. Uses the VM snapshot
-    parent/children relationships to determine tree structure.
-    Returns root nodes sorted by snapshot_time (oldest first). *)
+(** Retrieve the snapshot tree for [vdi]. The tree is built by:
+      1. locating the live VM that has [vdi] attached,
+      2. determining the [userdevice] of that VBD (disk slot identity),
+      3. enumerating all snapshot VMs of the live VM and reconstructing
+         their parent/children relationships,
+      4. projecting each snapshot VM down to the disk in the same slot.
+    Returns root nodes sorted by [snapshot_time] (oldest first). *)
 let get_snapshot_tree ~dbg ~vdi =
   D.debug "%s retrieving snapshot tree for VDI %s" __FUNCTION__ (s_of_vdi vdi) ;
   try
@@ -293,48 +334,46 @@ let get_snapshot_tree ~dbg ~vdi =
         | None ->
             D.warn "%s no active VM found for VDI %s" __FUNCTION__ vdi_uuid ;
             []
-        | Some vm ->
-            let open Xapi_database.Db_filter_types in
-            let all_snapshots =
-              Db.VM.get_refs_where ~__context
-                ~expr:
-                  (Eq (Field "snapshot_of", Literal (Ref.string_of vm)))
-              |> List.filter (fun s ->
-                     Db.VM.get_is_a_snapshot ~__context ~self:s
-                 )
-            in
-            if all_snapshots = [] then (
-              D.debug "%s no snapshots for VM %s" __FUNCTION__
-                (Db.VM.get_uuid ~__context ~self:vm) ;
+        | Some vm -> (
+          match find_userdevice_for_vdi ~__context ~vm ~vdi_ref with
+          | None ->
+              D.warn "%s no disk VBD on VM %s for VDI %s" __FUNCTION__
+                (Db.VM.get_uuid ~__context ~self:vm) vdi_uuid ;
               []
-            ) else
-              (* Trace parent chain from VM upward to identify active path *)
-              let active_path =
-                let rec trace snap acc =
-                  if snap = Ref.null then
-                    acc
-                  else
-                    trace
-                      (Db.VM.get_parent ~__context ~self:snap)
-                      (snap :: acc)
-                in
-                trace (Db.VM.get_parent ~__context ~self:vm) []
-              in
-              let roots =
-                all_snapshots
+          | Some userdevice ->
+              let open Xapi_database.Db_filter_types in
+              let all_snapshots =
+                Db.VM.get_refs_where ~__context
+                  ~expr:(Eq (Field "snapshot_of", Literal (Ref.string_of vm)))
                 |> List.filter (fun s ->
-                       Db.VM.get_parent ~__context ~self:s = Ref.null
+                       Db.VM.get_is_a_snapshot ~__context ~self:s
                    )
-                |> sort_snapshots_by_time ~__context
-                |> List.filter_map
-                     (build_snapshot_subtree ~__context ~leaf_vdi_ref:vdi_ref
-                        ~active_path
-                     )
               in
-              D.debug "%s %d root(s), %d total node(s) for VDI %s"
-                __FUNCTION__ (List.length roots) (count_tree_nodes roots)
-                vdi_uuid ;
-              roots
+              if all_snapshots = [] then (
+                D.debug "%s no snapshots for VM %s" __FUNCTION__
+                  (Db.VM.get_uuid ~__context ~self:vm) ;
+                []
+              ) else
+                let on_active_path =
+                  build_active_path_predicate ~__context ~vm
+                in
+                let roots =
+                  all_snapshots
+                  |> List.filter (fun s ->
+                         Db.VM.get_parent ~__context ~self:s = Ref.null
+                     )
+                  |> sort_snapshots_by_time ~__context
+                  |> List.concat_map
+                       (build_subtree_for_userdevice ~__context ~userdevice
+                          ~on_active_path
+                       )
+                in
+                D.debug
+                  "%s VDI %s lives at userdevice=%s, %d root(s), %d node(s)"
+                  __FUNCTION__ vdi_uuid userdevice (List.length roots)
+                  (count_tree_nodes roots) ;
+                roots
+        )
     )
   with e ->
     D.error "%s failed to retrieve snapshot tree: %s" __FUNCTION__
@@ -422,22 +461,25 @@ let prepare_branch_vdi ~ctx ~dest_snapshot =
   in
   (bv, bdp, nbd_uri, cleanup)
 
-(** Recursively mirror a snapshot tree node into [dest_vdi], then recurse
-    into children. Active-path children reuse the same [dest_vdi] (they
-    continue the main chain); side-branch children receive a VDI.clone of
-    the snapshot so the storage-layer branching is preserved on the
-    destination. Returns accumulated [snapshot_relation] mappings. *)
-let rec process_snapshot_node ~ctx ~dest_vdi ~dest_dp ~nbd_uri ~counter ~total
+(** Mirror a single snapshot-tree node into the supplied [working_vdi],
+    take a destination snapshot to anchor the mirrored data, and return
+    the destination snapshot info plus the [snapshot_relation] entry.
+
+    This is the unit of work executed at every node, regardless of
+    whether the node sits on the active path or on a reverted branch --
+    the only thing that changes between those cases is which VDI is
+    passed as [working_vdi]. *)
+let mirror_node_into ~ctx ~working_vdi ~working_dp ~nbd_uri ~counter ~total
     node =
   incr counter ;
-  SXM.info "%s [%d/%d] mirroring snapshot %s into %s" __FUNCTION__ !counter
-    total node.vdi_uuid (s_of_vdi dest_vdi.vdi) ;
-  (* Give the NBD proxy thread time to start listening before issuing the
-     mirror RPC. A proper fix would use a Mutex+Condition for readiness
-     signalling — tracked as a follow-up. *)
+  SXM.info "%s [%d/%d] mirroring snapshot %s into VDI %s" __FUNCTION__
+    !counter total node.vdi_uuid (s_of_vdi working_vdi.vdi) ;
+  (* Give the NBD proxy thread time to start listening before issuing
+     the mirror RPC. A proper fix would use a Mutex+Condition for
+     readiness signalling -- tracked as a follow-up. *)
   let _ : Thread.t =
     start_nbd_proxy_thread ~url:ctx.url ~mirror_vm:ctx.mirror_vm
-      ~dest_sr:ctx.dest_sr ~mirror_vdi:dest_vdi ~mirror_datapath:dest_dp
+      ~dest_sr:ctx.dest_sr ~mirror_vdi:working_vdi ~mirror_datapath:working_dp
       ~verify_dest:ctx.verify_dest
   in
   Unix.sleepf mirror_poll_interval ;
@@ -445,34 +487,83 @@ let rec process_snapshot_node ~ctx ~dest_vdi ~dest_dp ~nbd_uri ~counter ~total
     mirror_snapshot_into_existing_dest ~dbg:ctx.dbg ~sr:ctx.sr
       ~snapshot_vdi_uuid:node.vdi_uuid ~dest_sr:ctx.dest_sr ~dest_url:ctx.url
       ~verify_dest:ctx.verify_dest ~mirror_vm:ctx.mirror_vm
-      ~copy_vm:ctx.copy_vm ~dest_vdi_info:dest_vdi ~nbd_uri
+      ~copy_vm:ctx.copy_vm ~dest_vdi_info:working_vdi ~nbd_uri
   in
-  let this_relation =
+  let relation =
     State.
       { src_vdi= Vdi.of_string node.vdi_uuid
       ; dest_vdi= dest_snapshot.vdi
       ; snapshot_time= node.snapshot_time
       }
   in
-  let child_relations =
+  (dest_snapshot, relation)
+
+(** DFS through the snapshot tree.
+
+    Invariants:
+    - [working_vdi] is the destination VDI currently impersonating the
+      source disk's leaf as we walk down a chain. On the root of the
+      whole tree this is the [mirror_vdi] created by [receive_start3];
+      whenever we descend into a non-active sibling we clone the parent
+      snapshot to obtain a fresh [working_vdi] for that subtree.
+    - At a branching node (multiple children) we process the
+      reverted/inactive subtrees first, each with its own cloned
+      [working_vdi] which is destroyed as soon as the subtree finishes.
+      The single active-path child is processed last and inherits the
+      same [working_vdi], so when recursion bottoms out on the deepest
+      active node the [working_vdi] is still the original [mirror_vdi]
+      and is correctly positioned for live-leaf mirroring.
+    - Inactive-first ordering also keeps resource usage low: a cloned
+      branch's attach handle, NBD socket and qemu mirror job are torn
+      down before the next branch starts. *)
+let rec dfs_process_node ~ctx ~working_vdi ~working_dp ~nbd_uri ~counter ~total
+    node =
+  let dest_snapshot, this_relation =
+    mirror_node_into ~ctx ~working_vdi ~working_dp ~nbd_uri ~counter ~total
+      node
+  in
+  let inactive_children, active_children =
+    List.partition (fun c -> not c.on_active_path) node.children
+  in
+  if List.length active_children > 1 then
+    D.warn "%s node %s has %d active-path children, expected <= 1"
+      __FUNCTION__ node.vdi_uuid (List.length active_children) ;
+  (* Process reverted/inactive subtrees first: each is rooted on a
+     fresh clone of [dest_snapshot] and its working VDI is destroyed
+     after the subtree finishes. *)
+  let inactive_relations =
     List.concat_map
       (fun child ->
-        let child_vdi, child_dp, child_nbd_uri, cleanup =
-          if child.on_active_path then
-            (dest_vdi, dest_dp, nbd_uri, Fun.id)
-          else
-            prepare_branch_vdi ~ctx ~dest_snapshot
+        let branch_vdi, branch_dp, branch_nbd_uri, cleanup =
+          prepare_branch_vdi ~ctx ~dest_snapshot
         in
-        let mappings =
-          process_snapshot_node ~ctx ~dest_vdi:child_vdi ~dest_dp:child_dp
-            ~nbd_uri:child_nbd_uri ~counter ~total child
+        let rels =
+          try
+            dfs_process_node ~ctx ~working_vdi:branch_vdi
+              ~working_dp:branch_dp ~nbd_uri:branch_nbd_uri ~counter ~total
+              child
+          with e ->
+            (try cleanup () with _ -> ()) ;
+            raise e
         in
         cleanup () ;
-        mappings
+        rels
       )
-      node.children
+      inactive_children
   in
-  this_relation :: child_relations
+  (* Then process the active continuation, reusing [working_vdi]
+     unchanged so the storage-layer chain keeps advancing on the same
+     leaf. There should be at most one active child; we recurse on all
+     of them defensively in case of upstream data inconsistency. *)
+  let active_relations =
+    List.concat_map
+      (fun child ->
+        dfs_process_node ~ctx ~working_vdi ~working_dp ~nbd_uri ~counter
+          ~total child
+      )
+      active_children
+  in
+  this_relation :: (inactive_relations @ active_relations)
 
 module MIRROR : SMAPIv2_MIRROR = struct
   type context = unit
@@ -517,9 +608,11 @@ module MIRROR : SMAPIv2_MIRROR = struct
       try
         (* The dest VDI starts writable from receive_start3.
            If there are snapshots, switch to readonly for snapshot mirroring,
-           recursively process the tree (branching at revert points),
-           then switch back to writable for the leaf.
-           If no snapshots, the dest VDI is already writable — proceed directly. *)
+           DFS through the tree (cloning at revert branches and reusing
+           [mirror_vdi] along the active path), then switch back to
+           writable so the live leaf mirror can land into [mirror_vdi]
+           directly. If no snapshots, the dest VDI is already writable — 
+           proceed directly. *)
         let snapshot_relations =
           if has_snapshots then (
             switch_vdi_to_readonly ~dbg ~url ~verify_dest ~mirror_datapath
@@ -529,8 +622,8 @@ module MIRROR : SMAPIv2_MIRROR = struct
             let relations =
               List.concat_map
                 (fun root ->
-                  process_snapshot_node ~ctx ~dest_vdi:mirror_vdi
-                    ~dest_dp:mirror_datapath ~nbd_uri ~counter ~total root
+                  dfs_process_node ~ctx ~working_vdi:mirror_vdi
+                    ~working_dp:mirror_datapath ~nbd_uri ~counter ~total root
                 )
                 snapshot_tree
             in
