@@ -127,15 +127,42 @@ let detach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm =
   Local.VDI.deactivate dbg dp sr snapshot_vdi copy_vm ;
   Local.VDI.detach dbg dp sr snapshot_vdi copy_vm
 
-(** Create a snapshot of the destination VDI to preserve the mirrored state *)
-let create_destination_snapshot ~dbg ~dest_sr ~dest_url ~verify_dest ~dest_vdi_info =
+(** Create a snapshot of the destination VDI to preserve the mirrored state.
+
+    [src_content_id] is the content_id of the source snapshot that was just
+    mirrored into [dest_vdi_info]. After taking the destination snapshot we
+    explicitly propagate this content_id onto the new dest snapshot via
+    [Remote.VDI.set_content_id]. This is required because:
+      - SMAPIv3 NBD-based mirror writes raw data only and does not carry
+        the source's content_id with it;
+      - the destination SR's [VDI.snapshot] (e.g. SMAPIv1 ext) auto-
+        generates a fresh content_id for the new snapshot VDI;
+      - the legacy SXM path in [xapi_vm_migrate.update_snapshot_info] then
+        calls [SR.update_snapshot_info_dest] which runs
+        [assert_content_ids_match] on every snapshot pair, and fails
+        with [Content_ids_do_not_match] unless dest's content_id equals
+        src's content_id.
+    Mirrors the legacy [storage_smapiv1_migrate.ml] post-copy pattern. *)
+let create_destination_snapshot ~dbg ~dest_sr ~dest_url ~verify_dest
+    ~dest_vdi_info ~src_content_id =
   let (module Remote) =
     Storage_migrate_helper.get_remote_backend dest_url verify_dest
   in
   D.debug "%s creating snapshot of destination VDI %s" __FUNCTION__
     (s_of_vdi dest_vdi_info.vdi) ;
-  Remote.VDI.snapshot dbg dest_sr
-    {dest_vdi_info with sm_config= [("snapshot_parent", "true")]}
+  let dest_snapshot =
+    Remote.VDI.snapshot dbg dest_sr
+      {dest_vdi_info with sm_config= [("snapshot_parent", "true")]}
+  in
+  D.debug "%s propagating src content_id %s onto dest snapshot %s"
+    __FUNCTION__ src_content_id (s_of_vdi dest_snapshot.vdi) ;
+  ( try
+      Remote.VDI.set_content_id dbg dest_sr dest_snapshot.vdi src_content_id
+    with e ->
+      D.warn "%s failed to set content_id on dest snapshot %s: %s"
+        __FUNCTION__ (s_of_vdi dest_snapshot.vdi) (Printexc.to_string e)
+  ) ;
+  {dest_snapshot with content_id= src_content_id}
 
 (** [mirror_snapshot_into_existing_dest] mirrors a single snapshot VDI into an
     existing destination VDI (typically the mirror_vdi created by receive_start3).
@@ -150,6 +177,19 @@ let mirror_snapshot_into_existing_dest ~dbg ~sr ~snapshot_vdi_uuid ~dest_sr
   let dp = Uuidx.(to_string (make ())) in
 
   try
+    (* Capture src snapshot content_id BEFORE attaching, so we can
+       propagate it onto the dest snapshot to satisfy
+       assert_content_ids_match in update_snapshot_info_dest. *)
+    let src_content_id =
+      try (Local.VDI.stat dbg sr snapshot_vdi).content_id
+      with e ->
+        D.warn "%s failed to stat src snapshot %s for content_id: %s"
+          __FUNCTION__ snapshot_vdi_uuid (Printexc.to_string e) ;
+        ""
+    in
+    D.debug "%s captured src snapshot %s content_id=%s" __FUNCTION__
+      snapshot_vdi_uuid src_content_id ;
+
     attach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm ;
     
     D.debug "%s starting QEMU mirror from snapshot %s" __FUNCTION__ snapshot_vdi_uuid ;
@@ -162,7 +202,8 @@ let mirror_snapshot_into_existing_dest ~dbg ~sr ~snapshot_vdi_uuid ~dest_sr
     detach_snapshot_vdi ~dbg ~dp ~sr ~snapshot_vdi ~copy_vm ;
     
     let dest_snapshot =
-      create_destination_snapshot ~dbg ~dest_sr ~dest_url ~verify_dest ~dest_vdi_info
+      create_destination_snapshot ~dbg ~dest_sr ~dest_url ~verify_dest
+        ~dest_vdi_info ~src_content_id
     in
     D.debug "%s destination snapshot created: %s" __FUNCTION__
       (s_of_vdi dest_snapshot.vdi) ;

@@ -10,12 +10,16 @@ Title: SMAPIv3 Migration with Snapshots - Design Brief
   - [Impact on migrated VMs](#impact-on-migrated-vms)
 - [New SMAPIv3 Migration Mechanism](#new-smapiv3-migration-mechanism)
   - [Design overview](#design-overview)
+  - [Why a tree, and not a chain](#why-a-tree-and-not-a-chain)
+  - [Key design decisions](#key-design-decisions)
   - [Migration phases](#migration-phases)
-    - [Phase 1: Discovery](#phase-1-discovery)
-    - [Phase 2: Sequential snapshot mirroring](#phase-2-sequential-snapshot-mirroring)
-    - [Phase 3: Leaf VDI mirroring](#phase-3-leaf-vdi-mirroring)
+    - [Phase 1: Snapshot tree discovery](#phase-1-snapshot-tree-discovery)
+    - [Phase 2: DFS tree traversal](#phase-2-dfs-tree-traversal)
+    - [Phase 3: Live leaf mirroring](#phase-3-live-leaf-mirroring)
     - [Phase 4: Metadata restoration](#phase-4-metadata-restoration)
   - [Complete migration flow](#complete-migration-flow)
+- [Implementation Approach](#implementation-approach)
+- [Additional Implementation Fixes](#additional-implementation-fixes)
 
 ## Overview
 
@@ -217,8 +221,18 @@ Why this works: By taking a snapshot first, SMAPIv1 creates a read-only copy of 
 entire disk state which is V2`. When this snapshot is copied to the destination, the copy operation 
 composes/flattens all data from the parent chain into a single complete image. The 
 destination receives a full, bootable disk that doesn't depend on missing parent nodes.
-the snapshot branch becomes separated, which looks 
-unusual but is out scope of this design, I will not extend more details here.
+
+Why the destination tree looks "split": SMAPIv1's order is **mirror first, copy 
+second**. The leaf is mirrored into a freshly created destination VDI, which has no
+parent at that point. When the snapshot copy phase runs next, it asks the destination 
+SR for `similar_contents` to find a VDI it can share base data with. Because the 
+mirrored leaf was created from scratch a moment ago, `similar_contents` returns 
+nothing useful, and each snapshot copy lands as an isolated tree on the destination 
+rather than re-using the freshly-mirrored leaf as a shared base. The result is a 
+visually separated snapshot branch on the destination — bootable and correct, just 
+not topologically identical to the source. This separation is a known SMAPIv1 
+behaviour and is out of scope of this design; we mention it only so readers do not 
+confuse it with a bug introduced by the SMAPIv3 work described below.
 
 The key point: SMAPIv1 migration creates a complete disk copy, so the destination VDI 
 is fully functional and bootable, even though the storage structure looks different. 
@@ -247,276 +261,352 @@ The fundamental difference:
 
 ### Design overview
 
-The enhanced SMAPIv3 migration introduces a **snapshot-aware migration process** that 
-preserves complete snapshot chains. The fundamental insight is that we can reuse the 
-same NBD mirroring mechanism that works for the leaf VDI to also mirror each snapshot 
-in the chain, one at a time, in the correct order.
+The enhanced SMAPIv3 migration introduces a **snapshot-tree-aware migration process**
+that reproduces the *full* snapshot topology on the destination — not just a linear
+chain, but the tree shape that arises when a user reverts to an earlier snapshot
+before taking new ones. We reuse the same NBD-backed QEMU mirror mechanism that
+already works for the leaf VDI to also mirror every snapshot in the tree, walking
+the tree depth-first and cloning at branch points so that revert-induced side
+branches are preserved alongside the main active path.
 
-The new SMAPIv3 migration process will following below steps:
+At a high level, the migration runs in four phases:
 
-1. Mirror each snapshot VDI individually, from oldest to 
-   newest (base-to-leaf order), it also require Storage API include mrirror and activate to make some change
-    to support when mirror a leaf mirror the leaf itself.
-   when mirror the snapshot, mirror it`s parent.
+1. **Snapshot tree discovery.** Build a snapshot tree for the disk being migrated by
+   projecting all snapshot VMs of the live VM onto the single disk slot identified
+   by the VBD `userdevice`. The tree's branching structure comes directly from each
+   snapshot VM's `parent`/`children` relationships and faithfully captures any
+   revert that occurred in the VM's history.
 
-2. After mirroring each snapshot's data into a 
-   temporary destination VDI, take a snapshot to preserve that state
+2. **DFS tree traversal.** Walk the tree depth-first. At every node, mirror its
+   source snapshot VDI into the current destination *working VDI* and then take a
+   destination snapshot to anchor the data. At a branching node — i.e. a node with
+   more than one child, meaning a revert happened there — recurse into each
+   reverted/inactive subtree on a fresh clone of the just-created anchor, and
+   recurse into the single active continuation on the **same** working VDI.
 
-3. Track the mapping between source and destination snapshot 
-   VDIs along with temporal metadata
+3. **Live leaf mirroring.** When DFS finishes, the working VDI is back to the
+   original `mirror_vdi` returned by `receive_start3`, positioned at the deepest
+   active-path snapshot. Switch it back to writable and run the continuous live
+   mirror for the running VM's leaf, exactly as the pre-existing SMAPIv3 design did.
 
-4. After all VDIs are migrated, restore the snapshot 
-   relationships on the destination
+4. **Metadata restoration.** Push the recorded (source snapshot, destination
+   snapshot, snapshot time) tuples to the destination via a new RPC,
+   `SR.set_snapshot_relations`, which writes `snapshot_of` / `snapshot_time` /
+   `is_a_snapshot` into both the XAPI database and the storage backend's own
+   metadata store. The orchestrator then updates each snapshot VM's VBD to reference
+   the destination snapshot VDI.
 
-5. Update all snapshot VM VBD references to point to the new 
-   destination snapshot VDIs
+### Why a tree, and not a chain
 
-### V3 SXM
-
-#### Phase 1: Discovery
-
-Before migration begins, the system discovers the complete snapshot chain for each 
-VDI being migrated:
-
-```
-Discovery Phase:
-
-Source Database Query:
-    V1 (leaf VDI)
-     ↓ query: get_snapshots
-     ↓
-    [S2, S1]  ← snapshot references
-     ↓
-    Retrieve metadata for each:
-      S2: { uuid: "s2-uuid", snapshot_time: "2024-01-15T10:30:00Z" }  (older)
-      S1: { uuid: "s1-uuid", snapshot_time: "2024-01-16T14:20:00Z" }  (newer)
-
-Result: [(s2-uuid, 2024-01-15T10:30:00Z), (s1-uuid, 2024-01-16T14:20:00Z)]
-         ↑ Base-to-leaf order (S2 first, then S1)
-```
-
-The discovery process:
-- Queries the database for all snapshots of the leaf VDI
-- Extracts both the snapshot UUID and the original creation timestamp
-- Orders snapshots from oldest to newest (base-to-leaf)
-- Returns a list of snapshot metadata to process
-
-#### Phase 2: Sequential snapshot mirroring
-
-Each snapshot is then mirrored in sequence, from oldest to newest. For each snapshot:
+For a VM that only ever takes snapshots in chronological order, the snapshot history
+is linear:
 
 ```
-Snapshot Mirroring (Example: S2, the oldest snapshot):
-
-Step 1: Start NBD Proxy
-    Source SR                    Destination SR
-    ---------                    --------------
-    S2 (attach read-only)   <--- NBD Proxy <--- Mirror VDI (activated read-only)
-                                     
-                                     
-Step 2: Mirror Operation
-    Source SR                    Destination SR
-    ---------                    --------------
-    S2 -------- QEMU Mirror ---> Mirror VDI (receives S2 data)
-    (read blocks)                (write blocks)
-    
-Step 3: Snapshot Destination
-    Source SR                    Destination SR
-    ---------                    --------------
-    S2                           Mirror VDI (has S2 data)
-                                      ↓ VDI.snapshot
-                                    S2' (snapshot of mirror VDI)
-                                    
-Step 4: Record Mapping
-    Mapping Table: {
-      S2 (source) ↔ S2' (dest), timestamp: 2024-01-15T10:30:00Z
-    }
+snap1 → snap2 → snap3 → live
 ```
 
-The process repeats for each snapshot in order:
+Once the user **reverts** to an earlier snapshot (e.g. revert to `snap1`) and then
+takes new snapshots `snap3', snap4'`, the history forks:
 
 ```
-Complete Snapshot Migration Sequence:
-
-Source SR                                    Destination SR
----------                                    --------------
-
-Iteration 1:
-    S1 (oldest)  ---- mirror ----->          Mirror VDI (receives S1 data)
-                                                  ↓ snapshot
-                                                 S1'
-
-                                                
-                                                V3 (Top base)
-Iteration 2:                                  /           ↓ snapshot
-S2 (newer)   ---- mirror ----->              V2`              S1'
-                                               ↓ snapshot
-                                                 S2'
-Mapping Table After Completion:
-    S2 ↔ S2', timestamp: 2024-01-15T10:30:00Z
-    S1 ↔ S1', timestamp: 2024-01-16T14:20:00Z
+snap1 ─┬─ snap2          (the original, now-orphaned line)
+       └─ snap3' → snap4' (the new, active line that leads to the live VM)
 ```
 
-The critical aspect is that each snapshot is mirrored into the same destination 
-mirror VDI, and a snapshot is taken after each mirror to preserve that state. This 
-creates a chain of destination snapshots that mirrors the source chain structure.
+XAPI models this fork via each snapshot VM's `parent`/`children` pointers: both
+`snap2` and `snap3'` are children of `snap1`, but only the chronologically-newer
+descendant is on the **active path** that ultimately leads to the live VM. The
+previous, chain-based design assumed a single path and silently dropped the
+orphaned subtree, leaving the destination with a broken/incomplete topology after
+migration. The new tree-based design preserves both lines.
 
-#### Phase 3: Leaf VDI mirroring
+### Key design decisions
 
-After all snapshots are mirrored, the destination VDI is switched from read-only to 
-read-write mode, and the leaf VDI mirroring proceeds as in the original SMAPIv3 design:
+#### Cross-snapshot disk identity by `userdevice`, not `snapshot_of`
+
+A snapshot VDI's `snapshot_of` field points at the active VDI that existed *at the
+time the snapshot was taken*. A revert destroys that active VDI and produces a new
+one with a new ref, so pre-revert snapshot VDIs end up with `snapshot_of` pointing
+at a stale ref. Using `snapshot_of` to find "the same disk" across snapshot VMs is
+therefore unreliable.
+
+Instead, the new design identifies each disk by its VBD **`userdevice`** (the disk
+slot inside the VM, e.g. "0"). `userdevice` is preserved across reverts: every
+snapshot VM that contains this disk has a VBD with the same userdevice pointing at
+the snapshot VDI for that slot. We look up the userdevice once on the live VM's
+VBD, then project each snapshot VM onto that single slot to obtain the snapshot
+VDI we need.
+
+#### Active path detection by walking `VM.parent`
+
+Each snapshot VM has a `VM.parent` pointer to the previously-active snapshot VM at
+the moment it was taken. Walking `parent` upward from the live VM yields the
+ordered set of snapshot VMs that lie on the active path. Any snapshot VM that does
+*not* appear in this walk is by definition on a reverted/inactive branch.
+
+#### DFS, inactive-first, active-last
+
+The recursive structure of the traversal is the single most important property of
+this design and is what guarantees correctness with respect to the live mirror
+hand-off. At every tree node:
+
+1. **Mirror & anchor.** Run a one-shot QEMU mirror from the node's source snapshot
+   VDI into the current `working_vdi`, then call `Remote.VDI.snapshot working_vdi`
+   to take a destination snapshot. The freshly created destination snapshot serves
+   two purposes simultaneously: it records this node's mirrored data, and it acts
+   as a stable base from which any inactive subtree can be cloned.
+
+2. **Partition children** by `on_active_path`. There is at most one active child
+   per node (more than one would indicate corrupt XAPI state and is logged as a
+   warning); the remaining children are inactive (reverted) subtrees.
+
+3. **Recurse into inactive subtrees first.** For each inactive child, clone the
+   just-created destination anchor (`Remote.VDI.clone dest_snapshot`) and use that
+   clone as a fresh working VDI for the child subtree. After the subtree finishes,
+   deactivate, detach, and destroy the clone. Each inactive subtree is fully
+   self-contained: it never sees or touches `mirror_vdi`.
+
+4. **Recurse into the active continuation last**, reusing the same `working_vdi`.
+   When recursion bottoms out at the deepest active-path snapshot, `working_vdi` is
+   *still* the original `mirror_vdi` returned by `receive_start3` — no
+   post-traversal "splice" or rename step is needed. Phase 3's live leaf mirror
+   simply switches that VDI to writable and continues mirroring on top of it.
+
+Processing inactive subtrees before the active continuation also bounds the number
+of simultaneously-attached destination VDIs to `O(depth of nesting)` rather than
+`O(number of branches)`: each inactive branch's clone, datapath, NBD socket and
+QEMU mirror job are torn down before the next branch starts.
+
+### Migration phases
+
+#### Phase 1: Snapshot tree discovery
 
 ```
-Leaf VDI Mirroring:
+Input:  the active VDI ref of the disk to be migrated
 
-Source SR                                    Destination SR
----------                                    --------------
+  1. Find the live VM that owns the VDI (via VDI.VBDs, filtering out
+     VBDs whose VM is a snapshot).
+  2. On that live VM, find the VBD pointing at the VDI and read its
+     userdevice (e.g. "0"). This is the disk identity used for projection.
+  3. Enumerate all snapshot VMs of the live VM (snapshot_of = live VM).
+  4. Reconstruct the snapshot VM tree from each snapshot VM's
+     parent / children pointers.
+  5. Walk VM.parent upward from the live VM and record every snapshot
+     VM encountered; this is the active-path membership set.
+  6. Project each snapshot VM onto the userdevice slot: for each snapshot
+     VM, find the VBD with the same userdevice; that VBD's VDI is the
+     snapshot for this disk at that point. Snapshot VMs that do not
+     contain the disk (e.g. the disk was hot-unplugged when the snapshot
+     was taken) are transparently skipped, and their disk-bearing
+     descendants are promoted to take their place, so no snapshot data
+     is dropped from the tree.
 
-    V1 (leaf)                                Mirror VDI
-    | active                                      ↑
-    | receives VM writes                    V3 (Top base)
-    |                                      /           ↓ snapshot
-    |                                     V2`              S2'
-    |                                     |  ↓ snapshot
-    |                                     |   S1'
-    |  -- qemu mirror (continuous) ----> V1`    
-                                          ↓
-                                    receives writes
-                                    (read-write mode)
-
-At migration finish:
-    V1 becomes V1' on destination
+Output: snapshot_tree_node tree, where each node carries
+  { vdi_uuid; snapshot_time; on_active_path; children }
+  with roots (VM.parent = null) ordered by snapshot_time ascending.
 ```
 
-This phase is identical to the original SMAPIv3 migration, but now occurs **after** 
-all snapshots have been migrated, ensuring the complete chain is preserved.
+Concrete example: live VM has snapshots `snap1`, then `snap2`; user reverts to
+`snap1` and takes `snap3` followed by `snap4`. The discovered tree is:
+
+```
+snap1 (on_active_path = true, oldest)
+├── snap2 (on_active_path = false)   ← the original line, orphaned by revert
+└── snap3 (on_active_path = true)
+    └── snap4 (on_active_path = true, parent of live VM)
+```
+
+#### Phase 2: DFS tree traversal
+
+For each root, recurse. At every node `N` with current working VDI `W`:
+
+```
+process_node(N, W):
+
+  ── Mirror & anchor ──────────────────────────────────────────────
+  1. Start an NBD proxy targeting W on the destination.
+  2. QEMU mirror from N.vdi into W (one-shot, wait for completion).
+  3. dest_snapshot ← Remote.VDI.snapshot(W)
+  4. Record (N.vdi, dest_snapshot.vdi, N.snapshot_time) in the
+     mirror-id-keyed mapping table.
+
+  ── Partition children ───────────────────────────────────────────
+  5. inactive_children := children where on_active_path = false
+     active_children   := children where on_active_path = true   (≤ 1)
+
+  ── Recurse into inactive subtrees ───────────────────────────────
+  6. For each child in inactive_children:
+       branch_vdi ← Remote.VDI.clone(dest_snapshot)
+       attach branch_vdi read-only, build NBD URI
+       process_node(child, branch_vdi)
+       deactivate / detach / destroy branch_vdi
+
+  ── Recurse into the active continuation ─────────────────────────
+  7. For the (single) child in active_children:
+       process_node(child, W)        ← same working VDI, unchanged
+```
+
+Worked trace for the example above, with `mirror_vdi` as the initial working VDI:
+
+```
+Step  Operation                                         working_vdi
+────  ──────────────────────────────────────────────────  ─────────────
+ 1    mirror snap1  ─→ working_vdi                      mirror_vdi
+ 2    VDI.snapshot working_vdi  ─→ dest_snap_1          mirror_vdi
+ 3    clone(dest_snap_1) ─→ branch_v2; attach readonly  branch_v2
+ 4    mirror snap2  ─→ branch_v2                        branch_v2
+ 5    VDI.snapshot branch_v2 ─→ dest_snap_2             branch_v2
+ 6    destroy branch_v2                                 (gone)
+ 7    mirror snap3  ─→ working_vdi                      mirror_vdi
+ 8    VDI.snapshot working_vdi ─→ dest_snap_3           mirror_vdi
+ 9    mirror snap4  ─→ working_vdi                      mirror_vdi
+10    VDI.snapshot working_vdi ─→ dest_snap_4           mirror_vdi
+```
+
+After step 10, `working_vdi` is the original `mirror_vdi`, sitting at the deepest
+active-path snapshot (snap4). The destination's storage-layer topology mirrors the
+source: a main chain from base through `dest_snap_1 → dest_snap_3 → dest_snap_4`
+plus a side branch `dest_snap_2` hanging off the `dest_snap_1` anchor. The mapping
+table accumulated during the walk is:
+
+```
+snap1 ↔ dest_snap_1   (snapshot_time T1)
+snap2 ↔ dest_snap_2   (snapshot_time T2)
+snap3 ↔ dest_snap_3   (snapshot_time T3)
+snap4 ↔ dest_snap_4   (snapshot_time T4)
+```
+
+#### Phase 3: Live leaf mirroring
+
+Identical to the pre-existing SMAPIv3 design, with one extra wrapper. Because Phase
+2 ran with `mirror_vdi` activated read-only (snapshots are read-only operations),
+we switch it back to writable before starting the live mirror:
+
+```
+Remote.VDI.deactivate dbg mirror_datapath dest_sr mirror_vdi mirror_vm
+Remote.VDI.activate3  dbg mirror_datapath dest_sr mirror_vdi mirror_vm
+```
+
+Then we start the NBD proxy and call `Local.DATA.mirror` against the live VM's leaf
+VDI exactly as before. Because Phase 2's recursion left `mirror_vdi` correctly
+positioned, the live mirror lands on top of the full chain without any explicit
+splicing step.
 
 #### Phase 4: Metadata restoration
 
-After all VDIs are migrated, the system restores snapshot metadata and relationships. from storage layer pespective, relationship has been built since the snapshot was created,
-but from toolstack perspective, relationship has not been built, so we need to restore the relationship:
+After the live leaf mirror reaches the "complete" state, the orchestrator in
+`xapi_vm_migrate.ml` retrieves the recorded mappings and applies them to the
+destination:
 
 ```
-Metadata Restoration:
-
-Step 1: Retrieve Mapping Table
-    S2 ↔ S2', timestamp: 2024-01-15T10:30:00Z
-    S1 ↔ S1', timestamp: 2024-01-16T14:20:00Z
-    V1 ↔ V1'
-
-Step 2: Establish Relationships on Destination
-    For each snapshot mapping:
-      SET S2'.snapshot_of = V1'
-      SET S2'.snapshot_time = 2024-01-15T10:30:00Z
-      SET S2'.is_a_snapshot = true
-      
-      SET S1'.snapshot_of = V1'
-      SET S1'.snapshot_time = 2024-01-16T14:20:00Z
-      SET S1'.is_a_snapshot = true
-
-Step 3: Update VBD References
-    Snapshot VM 1:
-      VBD.VDI: S2 → S2'  (update reference)
-      
-    Snapshot VM 2:
-      VBD.VDI: S1 → S1'  (update reference)
-
-Final Result:
-    Main VM --VBD--> V1'              ✓ Working
-         |
-         └─→ Snapshots:
-              Snapshot VM 1 --VBD--> S2'   ✓ Working
-              Snapshot VM 2 --VBD--> S1'   ✓ Working
+1. relations ← State.get_snapshot_mappings mirror_id          (in xapi_vm_migrate)
+2. SMAPI.SR.set_snapshot_relations dbg dest_sr
+       [(snap_dest, leaf_dest, time); ...]                   (new RPC)
+   The mux-layer implementation iterates the list and, for each entry:
+     - Db.VDI.set_snapshot_of  ~self:snap_dest ~value:leaf_dest
+     - Db.VDI.set_snapshot_time ~self:snap_dest ~value:time
+     - Db.VDI.set_is_a_snapshot ~self:snap_dest ~value:true
+     - VDI.set_snapshot_metadata (RPC into the storage backend, so the
+       backend's own custom-keys store also reflects the new relations)
+3. For each (src snapshot, dest snapshot) pair, build a per-snapshot
+   mirror record and let xapi's existing per-VDI continuation update the
+   snapshot VMs' VBDs to point at the destination snapshot VDIs.
+4. State.remove_snapshot_mappings mirror_id   (free the temporary state)
 ```
 
-The metadata restoration ensures that all snapshot timestamps are preserved (maintaining temporal history), snapshot relationships point to the correct destination leaf VDI,
-all snapshot VMs have their VBDs updated to reference destination snapshot VDIs, the complete snapshot chain structure is intact on the destination.
+The destination ends up with a fully populated snapshot tree, both in the XAPI
+database and in the underlying storage backend, with all snapshot VMs' VBDs
+pointing at the right VDIs.
 
 ### Complete migration flow
 
-The complete migration flow can be as below:
-
 ```
-Complete SMAPIv3 Snapshot Migration Flow:
-
 ┌─────────────────────────────────────────────────────────────────────┐
-│ Phase 1: DISCOVERY                                                  │
+│ Phase 1: SNAPSHOT TREE DISCOVERY                                    │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  Source SR:                                                         │
-│      V1 (leaf)                                                      │
-│       ↓                                                             │
-│  Query snapshots → [S2, S1]                                         │
-│  Order: base-to-leaf → [(S2, T1), (S1, T2)]                         │
+│  Live VM ─→ VBD (userdevice = "0")                                  │
+│             ↓                                                       │
+│  Enumerate snapshot VMs of the live VM                              │
+│  Project each snapshot VM onto userdevice "0"                       │
+│  Reconstruct parent/children topology                               │
+│  Mark active-path nodes by walking VM.parent from live VM           │
+│                                                                     │
+│  Result (revert example):                                           │
+│                                                                     │
+│      snap1 ─┬─ snap2  (inactive, reverted-orphan branch)            │
+│             └─ snap3 ─ snap4  (active path → live VM)               │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
-
+                                  │
+                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ Phase 2: SNAPSHOT MIRRORING (Sequential)                            │
+│ Phase 2: DFS TREE TRAVERSAL                                         │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  Source SR              Destination SR                              │
-│  ----------             --------------                              │
+│  At each node: mirror → snapshot (anchor)                           │
+│  At each branch: clone anchor for inactive subtrees                 │
+│  Active continuation: same working VDI (mirror_vdi)                 │
 │                                                                     │
-│  Round 1:                                                           │
-│    S2 ------mirror----→ Mirror VDI --snapshot--→ S2'                │
+│  Source                       Destination                           │
+│  ──────                       ───────────                           │
+│  snap1   ── mirror   ──→   mirror_vdi  ─ snapshot ─→ dest_snap_1    │
+│                                                          │ clone    │
+│                                                          ▼          │
+│  snap2   ── mirror   ──→   branch_v2   ─ snapshot ─→ dest_snap_2    │
+│                            (then destroyed)                         │
+│  snap3   ── mirror   ──→   mirror_vdi  ─ snapshot ─→ dest_snap_3    │
+│  snap4   ── mirror   ──→   mirror_vdi  ─ snapshot ─→ dest_snap_4    │
 │                                                                     │
-│  Round 2:                                                           │
-│    S1 ------mirror----→ Mirror VDI --snapshot--→ S1'                │
-│                                                                     │
-│  Mapping: S2→S2'(T1), S1→S1'(T2)                                    │
+│  Mapping table accumulated:                                         │
+│    snap1↔dest_snap_1, snap2↔dest_snap_2,                            │
+│    snap3↔dest_snap_3, snap4↔dest_snap_4                             │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
-
+                                  │
+                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ Phase 3: LEAF MIRRORING (Continuous)                                │
+│ Phase 3: LIVE LEAF MIRROR                                           │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  Source SR              Destination SR                              │
-│  ----------             --------------                              │
+│  switch mirror_vdi: readonly → writable                             │
+│  V1 (live) ── continuous QEMU mirror ──→ mirror_vdi (becomes V1')   │
 │                                                                     │
-│    V1 ------mirror-----→ Mirror VDI (becomes V1')                   │
-│ (active,live VM)         receives ongoing writes                    │
-│                                                                     │
+│  Destination chain at end of Phase 3:                               │
+│    V1'  → dest_snap_4 → dest_snap_3 → dest_snap_1 → base            │
+│         (and dest_snap_2 hanging off dest_snap_1 as a side branch)  │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
-
+                                  │
+                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │ Phase 4: METADATA RESTORATION                                       │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  Destination SR Metadata:                                           │
+│  SR.set_snapshot_relations:                                         │
+│    for each (snap_dest, leaf_dest, time):                           │
+│      Db.VDI.set_snapshot_of  / snapshot_time / is_a_snapshot        │
+│      VDI.set_snapshot_metadata  (persist into backend store too)    │
 │                                                                     │
-│    S2': snapshot_of=V1', snapshot_time=T1, is_a_snapshot=true       │
-│    S1': snapshot_of=V1', snapshot_time=T2, is_a_snapshot=true       │
-│                                                                     │
-│  VBD Updates:                                                       │
-│    Snapshot VM 1: VBD.VDI = S2 → S2'                                │
-│    Snapshot VM 2: VBD.VDI = S1 → S1'                                │
+│  xapi: update each snapshot VM's VBD to point at the                │
+│        corresponding destination snapshot VDI.                      │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 
-Final Destination State:
+Final state on destination — both data AND topology preserved:
 
-    V1' (leaf VDI)
-    ↑
-    ├-→ S2' (snapshot, time=T1)
-    │   └─→ Snapshot VM 1 (VBD → S2')  ✓
-    │
-    └-→ S1' (snapshot, time=T2)
-        └─→ Snapshot VM 2 (VBD → S1')  ✓
-
-Main VM (VBD → V1')  ✓
+    V1' (live leaf)
+     ↑
+     ├─→ dest_snap_4 (Snapshot VM "snap4")   ✓
+     ├─→ dest_snap_3 (Snapshot VM "snap3")   ✓
+     ├─→ dest_snap_2 (Snapshot VM "snap2")   ✓  ← reverted branch preserved
+     └─→ dest_snap_1 (Snapshot VM "snap1")   ✓
 ```
 
-This design ensures the snapshot migration is fully accurate while reusing the existing 
-SMAPIv3 mirroring infrastructure. The key innovation is the sequential processing of 
-snapshots with destination snapshot creation after each mirror, building up the 
-destination chain incrementally and preserving all metadata and relationships.
-
-The result is that users experience seamless migration of VMs with snapshots, with 
-all snapshot functionality fully preserved on the destination host, including the 
-ability to start snapshot VMs, view snapshot history, and perform rollback operations.
+The result is that users experience seamless migration of VMs with snapshots —
+including those with revert history — with all snapshot functionality fully
+preserved on the destination host: snapshot VMs can boot, snapshot trees can be
+inspected, and the user can still revert to any snapshot after migration.
 
 ## Implementation Approach
 
@@ -524,73 +614,228 @@ This section describes how the snapshot migration mechanism integrates into the 
 
 ### Storage Interface Layer
 
-We need a new RPC call for restoring snapshot relationships after migration. The interface lives in `storage_interface.ml` where other SR operations are defined. Looking at existing snapshot operations like `SR.update_snapshot_info_dest`, we can follow the same pattern. The RPC takes a list of relations, where each relation is a tuple of (snapshot VDI, leaf VDI, timestamp string). After xapi finishes mirroring all snapshots, it calls this RPC to tell the storage layer "these VDIs on the destination are snapshots of that leaf VDI, and here are their timestamps."
+A new RPC call, `SR.set_snapshot_relations`, is added in `storage_interface.ml` for
+restoring snapshot relationships after migration. It follows the same shape as the
+pre-existing `SR.update_snapshot_info_dest` operation but is simpler: it takes a
+list of `(snapshot_vdi, leaf_vdi, snapshot_time_string)` tuples. After xapi
+finishes mirroring the whole snapshot tree, it calls this RPC once with the full
+mapping list, telling the destination storage layer "these VDIs on the destination
+are snapshots of that leaf VDI, taken at these times."
 
 ### Storage Multiplexer Layer
 
-The actual implementation goes in `storage_mux.ml`. This is straightforward - iterate through the relations list and for each one, update three database fields:
+The actual implementation of `SR.set_snapshot_relations` goes in `storage_mux.ml`.
+For each entry in the relations list, the mux:
 
 ```ocaml
-Db.VDI.set_snapshot_of ~__context ~self:snapshot_ref ~value:leaf_ref
+Db.VDI.set_snapshot_of   ~__context ~self:snapshot_ref ~value:leaf_ref
 Db.VDI.set_snapshot_time ~__context ~self:snapshot_ref ~value:timestamp
 Db.VDI.set_is_a_snapshot ~__context ~self:snapshot_ref ~value:true
+update_backend_snapshot_metadata ~dbg sr snapshot leaf snapshot_time
 ```
 
-The existing `update_snapshot_info_dest` function does something similar. We just need the simpler version that works for both SMAPIv1 and SMAPIv3 backends without special cases.
+The first three lines update XAPI's own VDI metadata so that the destination pool
+immediately knows the topology. The fourth line is a best-effort call into the
+storage backend (`VDI.set_snapshot_metadata`) that pushes the same three fields
+into the backend's custom-keys store, so the backend's own bookkeeping stays in
+sync with XAPI's view. The backend call is wrapped in try/catch and only logged
+on failure: data has already been migrated successfully, and the XAPI-level
+relations are sufficient for the user-visible snapshot tree to function.
 
 ### Storage Migration Helper
 
-During migration, we need somewhere to store the snapshot mappings temporarily. The `storage_migrate_helper.ml` module already has state management for mirrors using a mutex-protected hashtable. We add another hashtable here with the same pattern:
+During migration we need to temporarily stash the (src snapshot, dest snapshot,
+snapshot time) tuples between the moment they are produced (inside `send_start`
+in `storage_smapiv3_migrate.ml`) and the moment they are consumed (inside the
+per-VDI continuation in `xapi_vm_migrate.ml`). The `storage_migrate_helper.ml`
+module already protects existing mirror state with a mutex, so we add a parallel
+hashtable using the same pattern:
 
 ```ocaml
-let snapshot_mappings_table : (string, (vdi * vdi * string) list) Hashtbl.t
+type snapshot_relation = {
+    src_vdi: Storage_interface.Vdi.t
+  ; dest_vdi: Storage_interface.Vdi.t
+  ; snapshot_time: string
+}
+
+let snapshot_mappings : (string, snapshot_relation list) Hashtbl.t
 ```
 
-The key is the mirror ID, the value is the list of (source snapshot, dest snapshot, timestamp) tuples. Three simple functions: `set_snapshot_mappings` to store, `get_snapshot_mappings` to retrieve, and `remove_snapshot_mappings` to clean up. The existing code in this module shows exactly how to do mutex-protected hashtable operations.
+The key is the mirror ID and the value is the list of relations produced for that
+mirror. Three small functions wrap the hashtable: `set_snapshot_mappings` to
+store, `get_snapshot_mappings` to retrieve, and `remove_snapshot_mappings` to
+clean up. All three take the module-level `mutex`.
 
 ### SMAPIv3 Migration Logic
 
-This is where most of the work happens. The file `storage_smapiv3_migrate.ml` contains the `MIRROR` module that handles the actual mirroring process. We need to extend it in several places.
+This is where most of the work lives. The file `storage_smapiv3_migrate.ml`
+contains the `MIRROR` module that drives the actual send-side mirror flow. The
+implementation is organised as three layers, all in this one file.
 
-First, add a function to discover snapshots and extract their metadata. This queries the database for all snapshots of the VDI and returns them sorted oldest-first with their timestamps in ISO8601 format using `Date.to_rfc3339`:
+#### Tree builder (Phase 1)
+
+A small set of pure functions builds the snapshot tree from the XAPI database:
+
+- `find_active_vm_for_vdi`: given the migrating VDI ref, find the live (non-snapshot)
+  VM that has it attached.
+- `find_userdevice_for_vdi`: read the `userdevice` of the live VM's VBD that
+  references this VDI — this is the disk slot used to project snapshot VMs.
+- `find_snapshot_vdi_by_userdevice`: on a snapshot VM, locate the VBD with the
+  same userdevice and return the snapshot VDI it points at, together with the
+  snapshot time in ISO8601 (`Date.to_rfc3339`).
+- `build_active_path_predicate`: walks `VM.parent` upward from the live VM and
+  returns a `Ref.t -> bool` membership predicate for the active path.
+- `build_subtree_for_userdevice`: recursively constructs the tree from a root
+  snapshot VM, sorted by snapshot_time ascending. When a snapshot VM does not
+  contain the disk slot, it is dropped and its disk-bearing descendants are
+  promoted to take its place.
+- `get_snapshot_tree`: the top-level entry that wires the above together inside
+  a `Server_helpers.exec_with_new_task` and returns a list of root
+  `snapshot_tree_node` values.
+
+The `snapshot_tree_node` type encodes the projection of one VM-level snapshot
+tree onto one disk slot:
 
 ```ocaml
-let get_snapshot_chain ~__context ~vdi =
-  let snapshot_refs = Db.VDI.get_snapshots ~__context ~self:vdi in
-  List.map (fun snap_ref ->
-    let uuid = Db.VDI.get_uuid ~__context ~self:snap_ref in
-    let time = Db.VDI.get_snapshot_time ~__context ~self:snap_ref in
-    (uuid, Date.to_rfc3339 time)
-  ) snapshot_refs
-  |> List.sort (fun (_, t1) (_, t2) -> compare t1 t2)
+type snapshot_tree_node = {
+    vdi_uuid: string
+  ; snapshot_time: string
+  ; on_active_path: bool
+  ; children: snapshot_tree_node list
+}
 ```
 
-Second, add helper functions to keep the code clean. The snapshot mirroring process involves several steps that repeat for each snapshot, so factor them into helpers: one to attach/detach snapshots in readonly mode, another to wait for mirror completion with polling, another to create the destination snapshot, and a main function that orchestrates mirroring a single snapshot into the existing destination VDI. Add a key function `mirror_snapshot_into_existing_dest` does the full sequence: attach source snapshot readonly, start the mirror, wait for completion, detach, then call remote `VDI.snapshot` to preserve the state. It returns the destination snapshot VDI info.
+#### Mirror-and-anchor primitive
 
-Third, modify `send_start` to process snapshots before the leaf. At the start of `send_start`, call `get_snapshot_chain` to get the list. If there are snapshots, process them one by one using the helper functions. For each snapshot, the NBD proxy needs to be restarted fresh. After all snapshots are mirrored, switch the destination VDI from readonly to writable using `Remote.VDI.deactivate` followed by `Remote.VDI.activate3`. Then start the NBD proxy for the leaf and proceed with the leaf VDI mirror exactly as the current code does. Track the snapshot mappings (source, dest, timestamp) as you go.
+A few helpers package up the per-node steps so the DFS code itself stays small:
 
-Fourth, after the leaf mirror completes in `send_start`, store the mappings:
+- `attach_snapshot_vdi` / `detach_snapshot_vdi`: attach a source snapshot VDI
+  read-only on the source for the duration of the mirror.
+- `wait_for_mirror`: polls `DATA.stat` for completion / failure with a fixed
+  interval (`mirror_poll_interval`).
+- `create_destination_snapshot`: calls `Remote.VDI.snapshot` on the destination
+  to anchor whatever data currently lives in the working VDI.
+- `mirror_snapshot_into_existing_dest`: the full per-node mirror sequence —
+  attach source readonly, start the QEMU mirror, wait for completion, detach
+  source, then `create_destination_snapshot`. Returns the destination snapshot
+  VDI info.
+- `prepare_branch_vdi`: produces a fresh working VDI for an inactive subtree by
+  cloning a destination snapshot (`Remote.VDI.clone`), attaching it read-only,
+  building its NBD URI, and returning a cleanup thunk that detaches and destroys
+  the clone after the subtree finishes.
+- `mirror_node_into`: wraps `mirror_snapshot_into_existing_dest` so each node
+  becomes a single call that returns both the destination snapshot info and a
+  `State.snapshot_relation` record.
+
+All of these take their shared parameters via a `mirror_ctx` record so that the
+DFS function below has a small, readable signature.
+
+#### DFS processor (Phase 2)
 
 ```ocaml
-State.set_snapshot_mappings mirror_id snapshot_mappings
+let rec dfs_process_node ~ctx ~working_vdi ~working_dp ~nbd_uri ~counter
+    ~total node =
+  let dest_snapshot, this_relation =
+    mirror_node_into ~ctx ~working_vdi ~working_dp ~nbd_uri ~counter ~total node
+  in
+  let inactive_children, active_children =
+    List.partition (fun c -> not c.on_active_path) node.children
+  in
+  let inactive_relations =
+    List.concat_map (fun child ->
+      let branch_vdi, branch_dp, branch_nbd_uri, cleanup =
+        prepare_branch_vdi ~ctx ~dest_snapshot
+      in
+      let rels =
+        try
+          dfs_process_node ~ctx ~working_vdi:branch_vdi ~working_dp:branch_dp
+            ~nbd_uri:branch_nbd_uri ~counter ~total child
+        with e -> (try cleanup () with _ -> ()) ; raise e
+      in
+      cleanup () ; rels
+    ) inactive_children
+  in
+  let active_relations =
+    List.concat_map (fun child ->
+      dfs_process_node ~ctx ~working_vdi ~working_dp ~nbd_uri ~counter
+        ~total child
+    ) active_children
+  in
+  this_relation :: (inactive_relations @ active_relations)
 ```
 
-Addtionallym, before `send_start`, update `receive_start` to activate the initial destination VDI in readonly mode instead of writable. This is because we need to mirror snapshots into it first before switching to writable for the leaf. Change `Remote.VDI.activate3` to `Remote.VDI.activate_readonly`.
+The partition + inactive-first ordering is what gives the design its two key
+properties: (a) the original `mirror_vdi` is never aliased into a non-active
+subtree, so the active continuation always lands on it, and (b) the cleanup of
+each inactive subtree's branch VDI runs before the next branch starts.
+
+#### `send_start` integration
+
+`send_start` calls `get_snapshot_tree` immediately after `VDI.attach3`. If the
+tree is empty (no snapshots), the existing leaf-only fast path runs unchanged.
+Otherwise:
+
+1. `switch_vdi_to_readonly ~mirror_vdi` — deactivate + re-activate in read-only
+   mode so the destination VDI can be safely snapshotted by Phase 2.
+2. `List.concat_map (dfs_process_node ~working_vdi:mirror_vdi ...) snapshot_tree`
+   — walk every root depth-first and collect a flat list of
+   `snapshot_relation` records.
+3. `switch_vdi_to_writable ~mirror_vdi` — deactivate + `activate3` so the live
+   leaf mirror in Phase 3 has a writable target.
+4. Start the NBD proxy for the leaf, call `Local.DATA.mirror`, register the
+   send-side state, and `wait_for_mirror`.
+5. `State.set_snapshot_mappings mirror_id snapshot_relations` so the
+   orchestrator in `xapi_vm_migrate.ml` can pick them up after the live mirror
+   reaches the complete state.
+
+Note that the destination VDI created by `receive_start3` is activated writable;
+the readonly/writable transitions are owned by the **send** side via the two
+`switch_vdi_to_*` helpers, not by the receive side. This keeps `receive_start3`
+identical to the snapshot-free path.
 
 ### VM Migration Orchestration
 
-The `xapi_vm_migrate.ml` file orchestrates the whole migration. In the `vdi_copy_fun` function, after `mirror_to_remote` completes, we need to retrieve the snapshot mappings using the mirror ID, call the new RPC to restore snapshot relationships on the destination, create mirror records for the snapshot VDIs (similar to the main VDI mirror record) so the continuation function can update VBD references, then clean up the stored mappings.
+The `xapi_vm_migrate.ml` file orchestrates the overall VM-level migration. Two
+integration points are needed.
 
-There's also logic in `migrate_send'` that determines which VDIs need explicit copying beyond the main VDI. The `extra_vdis` list normally includes both suspend VDIs and snapshot VDIs. We need to detect when any VDI is on an SMAPIv3 SR and has snapshots - in that case, exclude snapshot VDIs from the copy list since they're now handled through the mirror path. Suspend VDIs still need explicit copying.
+**Inside `vdi_copy_fun`**, after the per-VDI mirror reaches the complete state,
+the code retrieves the recorded snapshot mappings by mirror ID, makes the new
+`SR.set_snapshot_relations` RPC call against the destination, builds a
+per-snapshot mirror record for each (src, dest) pair so xapi's existing
+continuation can rewrite the snapshot VMs' VBD references, and finally removes
+the mapping table entry:
 
 ```ocaml
-let extra_vdis =
-  if has_smapiv3_snapshots then (
-   debug "excluding SMAPIv3 snapshots from copy list (already mirrored)" ;
-    suspends_vdis
-   ) else
-    suspends_vdis @ snapshots_vdis
+let snapshot_relations = get_snapshot_relations mirror_id in
+call_set_snapshot_relations ~dest_sr ~leaf_vdi:remote_vdi snapshot_relations ;
+let snapshot_mirror_records =
+  List.filter_map create_snapshot_mirror_record snapshot_relations
+in
+let result = post_mirror mirror_id mirror_record in
+List.iter (fun mr -> ignore (continuation mr)) snapshot_mirror_records ;
+Option.iter Storage_migrate_helper.State.remove_snapshot_mappings mirror_id ;
+result
 ```
+
+**Inside `migrate_send'`**, the `extra_vdis` list traditionally bundled both
+suspend VDIs and snapshot VDIs together so they would be copied alongside the
+main mirror. With the new mechanism, SMAPIv3 snapshots are already migrated by
+the DFS path and must *not* be copied again — doing so would create a parallel,
+unrelated chain on the destination. The fix is a per-snapshot filter that
+excludes snapshot VDIs sitting on SMAPIv3 SRs from the explicit copy list,
+while suspend VDIs and SMAPIv1 snapshot VDIs continue to be copied as before:
+
+```ocaml
+let copyable_snapshots =
+  List.filter
+    (fun vconf -> Storage_mux_reg.smapi_version_of_sr vconf.sr <> SMAPIv3)
+    snapshots_vdis
+in
+let extra_vdis = suspends_vdis @ copyable_snapshots in
+```
+
+The filter is per-VDI rather than a single global flag, so mixed-SR scenarios
+(some snapshots on SMAPIv3, some on SMAPIv1) keep working without special-casing.
 
 ### Skeleton and Wrapper Layers
 
