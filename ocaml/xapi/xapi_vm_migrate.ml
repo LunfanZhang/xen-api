@@ -1000,22 +1000,10 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
     in
     try cont remote_vdi_ref
     with e ->
-      error
-        "[SXM-TRACE-DESTROY] with_remote_vdi cleanup: destroying remote VDI \
-         ref=%s location=%s due to exception: %s\nBacktrace:\n%s"
-        (Ref.string_of remote_vdi_ref) remote_vdi_str
-        (Printexc.to_string e) (Printexc.get_backtrace ()) ;
       ( try
           XenAPI.VDI.destroy ~rpc:remote.rpc ~session_id:remote.session
-            ~self:remote_vdi_ref ;
-          debug
-            "[SXM-TRACE-DESTROY] with_remote_vdi cleanup: remote VDI ref=%s \
-             destroyed"
-            (Ref.string_of remote_vdi_ref)
-        with d ->
-          error
-            "[SXM-TRACE-DESTROY] Failed to destroy remote VDI ref=%s: %s"
-            (Ref.string_of remote_vdi_ref) (Printexc.to_string d)
+            ~self:remote_vdi_ref
+        with _ -> error "Failed to destroy remote VDI"
       ) ;
       raise e
   in
@@ -1116,23 +1104,13 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
       | None ->
           ()
       ) ;
-      if mirror && not (Xapi_fist.storage_motion_keep_vdi () || copy) then (
-        let vdi_uuid_for_log =
-          try Db.VDI.get_uuid ~__context ~self:vconf.vdi with _ -> "<gone>"
-        in
-        debug
-          "[SXM-TRACE-DESTROY] post_mirror destroying LOCAL leaf VDI ref=%s \
-           uuid=%s (sr=%s)"
-          (Ref.string_of vconf.vdi) vdi_uuid_for_log
-          (Storage_interface.Sr.string_of vconf.sr) ;
+      if mirror && not (Xapi_fist.storage_motion_keep_vdi () || copy) then
         Helpers.call_api_functions ~__context (fun rpc session_id ->
             XenAPI.VDI.destroy ~rpc ~session_id ~self:vconf.vdi
-        )
-      ) ;
+        ) ;
       result
     with e ->
-      error "Catch error in post_mirror: %s\nBacktrace:\n%s"
-        (Printexc.to_string e) (Printexc.get_backtrace ()) ;
+      error "Catch error in post_mirror: %s" (Printexc.to_string e) ;
       let mirror_failed =
         match mirror_id with
         | Some mid ->
@@ -1227,89 +1205,15 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
             let snapshot_mirror_records =
               List.filter_map create_snapshot_mirror_record snapshot_relations
             in
-            debug
-              "[SXM-TRACE-MAP] disk vdi=%s built %d snapshot_mirror_records \
-               from %d snapshot_relations:\n%s"
-              vdi_uuid
-              (List.length snapshot_mirror_records)
-              (List.length snapshot_relations)
-              (snapshot_mirror_records
-              |> List.map (fun (mr : mirror_record) ->
-                     Printf.sprintf
-                       "  local_ref=%s local_vdi=%s remote_ref=%s \
-                        remote_vdi=%s"
-                       (Ref.string_of mr.mr_local_vdi_reference)
-                       (Storage_interface.Vdi.string_of mr.mr_local_vdi)
-                       (Ref.string_of mr.mr_remote_vdi_reference)
-                       (Storage_interface.Vdi.string_of mr.mr_remote_vdi)
-                 )
-              |> String.concat "\n"
-              ) ;
-            (* B2: dump destination SR tree after this disk's mirror tree is
-               fully created on dest. *)
-            ( try
-                XenAPI.SR.scan ~rpc:remote.rpc ~session_id:remote.session
-                  ~sr:dest_sr_ref ;
-                let dest_vdis =
-                  XenAPI.SR.get_VDIs ~rpc:remote.rpc
-                    ~session_id:remote.session ~self:dest_sr_ref
-                in
-                debug
-                  "[SXM-TRACE-TREE] ==== dest SR=%s tree after disk vdi=%s \
-                   (%d vdi(s)) ===="
-                  (Ref.string_of dest_sr_ref) vdi_uuid
-                  (List.length dest_vdis) ;
-                List.iter
-                  (fun vref ->
-                    try
-                      let uuid =
-                        XenAPI.VDI.get_uuid ~rpc:remote.rpc
-                          ~session_id:remote.session ~self:vref
-                      in
-                      let location =
-                        XenAPI.VDI.get_location ~rpc:remote.rpc
-                          ~session_id:remote.session ~self:vref
-                      in
-                      let is_snap =
-                        XenAPI.VDI.get_is_a_snapshot ~rpc:remote.rpc
-                          ~session_id:remote.session ~self:vref
-                      in
-                      let snap_of =
-                        XenAPI.VDI.get_snapshot_of ~rpc:remote.rpc
-                          ~session_id:remote.session ~self:vref
-                      in
-                      let sm_cfg =
-                        XenAPI.VDI.get_sm_config ~rpc:remote.rpc
-                          ~session_id:remote.session ~self:vref
-                      in
-                      debug
-                        "[SXM-TRACE-TREE]   ref=%s uuid=%s location=%s \
-                         is_snapshot=%b snapshot_of=%s sm_config=[%s]"
-                        (Ref.string_of vref) uuid location is_snap
-                        (Ref.string_of snap_of)
-                        (sm_cfg
-                        |> List.map (fun (k, v) -> k ^ "=" ^ v)
-                        |> String.concat ";"
-                        )
-                    with e ->
-                      debug
-                        "[SXM-TRACE-TREE]   ref=%s <error: %s>"
-                        (Ref.string_of vref) (Printexc.to_string e)
-                  )
-                  dest_vdis ;
-                debug "[SXM-TRACE-TREE] ==== end dest SR tree ===="
-              with e ->
-                error "[SXM-TRACE-TREE] failed to dump dest SR tree: %s"
-                  (Printexc.to_string e)
-            ) ;
+            (* Feed the leaf mirror record together with all per-snapshot
+               mirror records into [post_mirror] as a single list, so the
+               surrounding [with_many] continuation is invoked exactly once
+               for this disk. Calling the continuation multiple times would
+               re-enter outer cleanup logic for the same VDI and trigger
+               DBCache_NotFound on subsequent disks. *)
             let all_mirror_records =
               mirror_record :: snapshot_mirror_records
             in
-            debug
-              "[SXM-TRACE-MAP] feeding %d mirror_record(s) into with_many \
-               continuation in a single call (1 leaf + %d snapshots)"
-              (List.length all_mirror_records)
-              (List.length snapshot_mirror_records) ;
             let result = post_mirror mirror_id all_mirror_records in
             Option.iter Storage_migrate_helper.State.remove_snapshot_mappings
               mirror_id ;
@@ -1890,24 +1794,7 @@ let migrate_send' ~__context ~vm ~dest ~live:_ ~vdi_map ~vif_map ~vgpu_map
          VDIs can be destroyed *)
       if (not is_intra_pool) && not copy then
         List.iter
-          (fun vbd ->
-            let info_str =
-              try
-                let vdi = Db.VBD.get_VDI ~__context ~self:vbd in
-                let vdi_uuid =
-                  try Db.VDI.get_uuid ~__context ~self:vdi
-                  with _ -> "<gone>"
-                in
-                Printf.sprintf "vdi_ref=%s vdi_uuid=%s"
-                  (Ref.string_of vdi) vdi_uuid
-              with e -> "<" ^ Printexc.to_string e ^ ">"
-            in
-            debug
-              "[SXM-TRACE-DESTROY] destroying VBD ref=%s (%s) after \
-               inter-pool transfer"
-              (Ref.string_of vbd) info_str ;
-            Db.VBD.destroy ~__context ~self:vbd
-          )
+          (fun vbd -> Db.VBD.destroy ~__context ~self:vbd)
           (vbds @ snapshots_vbds) ;
       new_vm
     in
@@ -1957,25 +1844,12 @@ let migrate_send' ~__context ~vm ~dest ~live:_ ~vdi_map ~vif_map ~vgpu_map
         |> List.concat_map (fun self -> Db.VM.get_VTPMs ~__context ~self)
       in
       List.iter (fun self -> Xapi_vtpm.destroy ~__context ~self) vtpms ;
-      List.iter
-        (fun self ->
-          let uuid =
-            try Db.VM.get_uuid ~__context ~self with _ -> "<gone>"
-          in
-          debug
-            "[SXM-TRACE-DESTROY] Db.VM.destroy ref=%s uuid=%s (source-side \
-             cleanup after successful migration)"
-            (Ref.string_of self) uuid ;
-          Db.VM.destroy ~__context ~self
-        )
-        vm_and_snapshots
+      List.iter (fun self -> Db.VM.destroy ~__context ~self) vm_and_snapshots
     ) ;
     SMPERF.debug "vm.migrate_send exiting vm:%s" vm_uuid ;
     new_vm
   with e -> (
-    error
-      "[SXM-TRACE-OUTER] Caught %s: cleaning up\nBacktrace:\n%s"
-      (Printexc.to_string e) (Printexc.get_backtrace ()) ;
+    error "Caught %s: cleaning up" (Printexc.to_string e) ;
     (* We do our best to tidy up the state left behind *)
     Events_from_xenopsd.with_suppressed queue_name dbg vm_uuid (fun () ->
         try
