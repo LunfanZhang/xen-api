@@ -1346,7 +1346,7 @@ module VDIImpl (M : META) = struct
 
   (* Three individual key-sets with no transaction: a failure mid-way leaves
      partial state. This matches the existing pattern for other multi-key
-     operations in this module; the XAPI DB (updated by set_snapshot_relations)
+     operations in this module; the XAPI DB (updated by SR.update_snapshot_info_dest)
      is the authoritative source and takes precedence on SR.scan reconciliation. *)
   let set_snapshot_metadata ~dbg ~sr ~vdi ~snapshot_of ~snapshot_time ~is_a_snapshot =
     let vdi_str = Storage_interface.Vdi.string_of vdi in
@@ -2014,7 +2014,6 @@ let bind ~volume_script_dir =
   S.VDI.get_by_name (u "VDI.get_by_name") ;
   S.UPDATES.get (u "UPDATES.get") ;
   S.SR.update_snapshot_info_dest (u "SR.update_snapshot_info_dest") ;
-  S.SR.set_snapshot_relations (u "SR.set_snapshot_relations") ;
   S.TASK.stat (u "TASK.stat") ;
   S.DP.diagnostics (u "DP.diagnostics") ;
   S.TASK.destroy (u "TASK.destroy") ;

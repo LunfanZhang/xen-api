@@ -1491,11 +1491,6 @@ functor
         let dbg = Debug_info.to_string di in
         Impl.SR.update_snapshot_info_dest context ~dbg ~sr ~vdi ~src_vdi
           ~snapshot_pairs
-
-      let set_snapshot_relations context ~dbg ~sr ~relations =
-        with_dbg ~name:"SR.set_snapshot_relations" ~dbg @@ fun di ->
-        let dbg = Debug_info.to_string di in
-        Impl.SR.set_snapshot_relations context ~dbg ~sr ~relations
     end
 
     module Policy = struct

@@ -1140,28 +1140,6 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
     | None ->
         []
   in
-  let call_set_snapshot_relations ~dest_sr ~leaf_vdi relations =
-    match relations with
-    | [] ->
-        ()
-    | _ ->
-        debug "setting %d snapshot relation(s) on SR %s"
-          (List.length relations)
-          (Storage_interface.Sr.string_of dest_sr) ;
-        (* TypeCombinators encodes the relation list as nested pairs on the wire *)
-        let rpc_pairs =
-          List.map
-            (fun (r : Storage_migrate_helper.State.snapshot_relation) ->
-              (r.dest_vdi, (leaf_vdi, r.snapshot_time))
-            )
-            relations
-        in
-        (try SMAPI.SR.set_snapshot_relations dbg dest_sr rpc_pairs
-         with e ->
-           warn "failed to set snapshot relations on SR %s: %s"
-             (Storage_interface.Sr.string_of dest_sr) (Printexc.to_string e)
-        )
-  in
   let create_snapshot_mirror_record
       (r : Storage_migrate_helper.State.snapshot_relation) =
     let src_uuid = Storage_interface.Vdi.string_of r.src_vdi in
@@ -1200,8 +1178,6 @@ let vdi_copy_fun __context dbg vdi_map remote is_intra_pool remote_vdis so_far
               get_mirror_record ~new_dp remote_vdi remote_vdi_ref
             in
             let snapshot_relations = get_snapshot_relations mirror_id in
-            call_set_snapshot_relations ~dest_sr ~leaf_vdi:remote_vdi
-              snapshot_relations ;
             let snapshot_mirror_records =
               List.filter_map create_snapshot_mirror_record snapshot_relations
             in

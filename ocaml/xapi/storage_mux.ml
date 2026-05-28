@@ -378,25 +378,6 @@ module Mux = struct
         debug "set_snapshot_metadata for %s on backend: %s (ignored)"
           (s_of_vdi snapshot) (Printexc.to_string e)
 
-    let set_snapshot_relations () ~dbg ~sr ~relations =
-      with_dbg ~name:"SR.set_snapshot_relations" ~dbg @@ fun di ->
-      debug "SR.set_snapshot_relations dbg:%s sr:%s relations:%d"
-        dbg (s_of_sr sr) (List.length relations) ;
-      Server_helpers.exec_with_new_task "SR.set_snapshot_relations"
-        ~subtask_of:(Ref.of_string dbg) (fun __context ->
-          List.iter
-            (fun (snapshot, leaf, snapshot_time) ->
-              let snapshot_ref, _ = find_vdi ~__context sr snapshot in
-              let leaf_ref, _ = find_vdi ~__context sr leaf in
-              set_snapshot_time __context ~dbg ~sr ~vdi:snapshot ~snapshot_time ;
-              Db.VDI.set_snapshot_of ~__context ~self:snapshot_ref ~value:leaf_ref ;
-              Db.VDI.set_is_a_snapshot ~__context ~self:snapshot_ref ~value:true ;
-              update_backend_snapshot_metadata
-                ~dbg:(Debug_info.to_string di) sr snapshot leaf snapshot_time
-            )
-            relations
-        )
-
     let update_snapshot_info_dest () ~dbg ~sr ~vdi ~src_vdi ~snapshot_pairs =
       with_dbg ~name:"SR.update_snapshot_info_dest" ~dbg @@ fun _di ->
       info

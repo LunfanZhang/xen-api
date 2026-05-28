@@ -304,15 +304,19 @@ Because Phase 2 left `mirror_vdi` positioned on the correct chain, the live
 mirror lands on top of a complete base — no separate splicing step.
 
 **Phase 4 — Restore metadata.** Snapshot VDIs exist on the destination, but
-the destination SR does not yet know they are snapshots. We send the mapping
-table accumulated in Phase 2 to the destination via a new RPC,
-`SR.set_snapshot_relations`, which for each entry sets `snapshot_of`,
-`snapshot_time` and `is_a_snapshot` in the XAPI database *and* pushes the same
-fields into the backend's own custom-keys store. Finally, the orchestrator
-in `xapi_vm_migrate.ml` updates each snapshot VM's VBD to reference the
-destination snapshot VDI. The destination now has both the data and the
-topology, in both XAPI and the storage backend, and the snapshot tree is
-fully usable: snapshots can be inspected, booted, and reverted to.
+the destination SR does not yet know they are snapshots. We reuse the
+pre-existing SMAPIv1 SXM path for this step: the orchestrator in
+`xapi_vm_migrate.ml` feeds the per-snapshot mirror records into the same
+`update_snapshot_info` flow that legacy migration already uses, which RPCs
+into `SR.update_snapshot_info_dest` on the destination. For each entry that
+RPC sets `snapshot_of`, `snapshot_time` and `is_a_snapshot` in the XAPI
+database *and* pushes the same fields into the backend's own custom-keys
+store. The content_id check it performs is satisfied because Phase 2
+propagated `content_id` per-snapshot during the DFS. Finally the
+orchestrator updates each snapshot VM's VBD to reference the destination
+snapshot VDI. The destination now has both the data and the topology, in
+both XAPI and the storage backend, and the snapshot tree is fully usable:
+snapshots can be inspected, booted, and reverted to.
 
 ### notes
 
@@ -335,15 +339,19 @@ Two non-obvious choices are worth to be mentioned:
 ## Implementation Approach
 
 The implementation follows the four-phase flow described above and is spread
-across four files. Roughly:
+across three files. Roughly:
 
-| File                                            | Role                                                                                                  |
-| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `ocaml/xapi/storage_smapiv3_migrate.ml`         | Send-side: builds the snapshot tree, runs the DFS, mirrors each node, anchors with a dest snapshot.   |
-| `ocaml/xapi/storage_migrate_helper.ml`          | Shared state: a small mutex-protected table that carries snapshot mappings between sender and caller. |
-| `ocaml/xapi-idl/storage/storage_interface.ml`   | Adds one new RPC, `SR.set_snapshot_relations`, used by xapi to push the final mapping to the dest SR. |
-| `ocaml/xapi/storage_mux.ml`                     | Implements `SR.set_snapshot_relations` in the receive-side mux.                                       |
-| `ocaml/xapi/xapi_vm_migrate.ml`                 | Top-level orchestration: invokes the RPC after the leaf mirror completes and remaps snapshot-VM VBDs. |
+| File                                            | Role                                                                                                       |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `ocaml/xapi/storage_smapiv3_migrate.ml`         | Send-side: builds the snapshot tree, runs the DFS, mirrors each node, anchors with a dest snapshot.        |
+| `ocaml/xapi/storage_migrate_helper.ml`          | Shared state: a small mutex-protected table that carries snapshot mappings between sender and orchestrator.|
+| `ocaml/xapi/xapi_vm_migrate.ml`                 | Top-level orchestration: turns the mapping table into per-snapshot mirror records, remaps snapshot-VM VBDs, and reuses the legacy `update_snapshot_info` path to publish metadata to the dest SR. |
+
+No new SMAPI RPC is added. Phase 4 reuses the existing
+`SR.update_snapshot_info_dest` call (originally written for SMAPIv1 SXM):
+because the DFS now propagates `content_id` per snapshot, the assertion in
+that RPC succeeds for SMAPIv3 as well, and the metadata it writes is exactly
+what we need.
 
 The rest of this section walks the code in the order data flows through it.
 
@@ -494,31 +502,30 @@ The key is the `mirror_id`, and three small functions — `set_snapshot_mappings
 `get_snapshot_mappings`, `remove_snapshot_mappings` — wrap the table under
 the existing module-level mutex.
 
-### The new RPC: `SR.set_snapshot_relations`
+### The metadata-publishing RPC: reusing `SR.update_snapshot_info_dest`
 
-Once the live mirror is complete, xapi tells the destination SR which dest
-VDIs are snapshots of the migrated leaf. A new RPC,
-`SR.set_snapshot_relations`, is added to `storage_interface.ml`; it takes the
-destination SR plus a list of `(snapshot_vdi, leaf_vdi, snapshot_time_string)`
-tuples. Compared with the pre-existing `SR.update_snapshot_info_dest`, it is
-simpler: there is no content_id matching, because content_ids have already
-been propagated per-snapshot during the DFS (see fix below), and the call
-takes the full mapping list in one go rather than one snapshot at a time.
-
-The implementation lives in `storage_mux.ml` and, for each entry, updates
-both XAPI's database and the storage backend's own custom-keys store:
+Once the live mirror is complete, xapi must tell the destination SR which
+dest VDIs are snapshots of the migrated leaf. Rather than introduce a new
+RPC for this we reuse the pre-existing `SR.update_snapshot_info_dest` that
+SMAPIv1 SXM has always used. Its implementation in `storage_mux.ml` writes
+exactly the fields we need:
 
 ```ocaml
 List.iter
-  (fun (snapshot, leaf, snapshot_time) ->
-    let snapshot_ref, _ = find_vdi ~__context sr snapshot in
-    let leaf_ref, _     = find_vdi ~__context sr leaf in
-    set_snapshot_time __context ~dbg ~sr ~vdi:snapshot ~snapshot_time ;
-    Db.VDI.set_snapshot_of  ~__context ~self:snapshot_ref ~value:leaf_ref ;
-    Db.VDI.set_is_a_snapshot ~__context ~self:snapshot_ref ~value:true ;
-    update_backend_snapshot_metadata
-      ~dbg sr snapshot leaf snapshot_time
-  ) relations
+  (fun (local_snapshot, src_snapshot_info) ->
+    let local_snapshot_info =
+      find_sm_vdi ~vdi:local_snapshot ~vdi_info_list:local_vdis
+    in
+    assert_content_ids_match ~vdi_info1:local_snapshot_info
+      ~vdi_info2:src_snapshot_info ;
+    set_snapshot_time __context ~dbg ~sr ~vdi:local_snapshot
+      ~snapshot_time:src_snapshot_info.snapshot_time ;
+    set_snapshot_of __context ~dbg ~sr ~vdi:local_snapshot ~snapshot_of:vdi ;
+    set_is_a_snapshot __context ~dbg ~sr ~vdi:local_snapshot
+      ~is_a_snapshot:true ;
+    update_backend_snapshot_metadata ~dbg sr local_snapshot vdi
+      src_snapshot_info.snapshot_time
+  ) snapshot_pairs
 ```
 
 The first three calls update XAPI's own VDI metadata so the destination pool
@@ -527,8 +534,16 @@ the storage backend's own metadata store (via `VDI.set_snapshot_metadata`)
 so the backend's bookkeeping stays in sync with XAPI's view; failures here
 are logged but not raised, since the data has already been migrated and the
 XAPI-level relations are sufficient for the user-visible snapshot tree to
-function. The matching stubs in `storage_skeleton.ml` and forwarding in
-`storage_smapiv1_wrapper.ml` follow `update_snapshot_info_dest` mechanically.
+function.
+
+The `content_id` assertion at the top used to be the reason this RPC could
+not be reused for SMAPIv3 — destination snapshots had no content_id, so the
+check always failed. After the [content_id propagation
+fix](#propagating-content_id-from-source-snapshots-to-destination-snapshots),
+every destination snapshot is stamped with the source's content_id during
+the DFS, so the check now succeeds for SMAPIv3 too. With that single change
+the RPC is fit for both SMAPI versions and no parallel SMAPIv3-only RPC is
+needed.
 
 ### Orchestration: `xapi_vm_migrate.ml`
 
@@ -538,18 +553,19 @@ complete and ties everything together. Inside `vdi_copy_fun`, once
 
 1. retrieves the recorded relations for this mirror with
    `Storage_migrate_helper.State.get_snapshot_mappings`;
-2. calls `SR.set_snapshot_relations` against the destination SR to publish
-   the snapshot/leaf relationships (failures here are logged but do not
-   abort: the data is already on the destination);
-3. builds one `mirror_record` per `(src snapshot, dest snapshot)` pair via
-   `create_snapshot_mirror_record` so the surrounding per-VDI continuation
-   can rewrite each snapshot VM's VBD to point at its destination VDI;
-4. hands the leaf mirror record **together with all per-snapshot records**
+2. builds one `mirror_record` per `(src snapshot, dest snapshot)` pair via
+   `create_snapshot_mirror_record`; these records make each snapshot pair
+   visible to the existing per-VDI machinery — both the VBD-rewriting logic
+   that points snapshot VMs at their dest VDIs and, crucially, the
+   `snapshots_map` that `migrate_send'` later feeds into
+   `update_snapshot_info`, which in turn RPCs into
+   `SR.update_snapshot_info_dest` on the destination to publish the
+   metadata;
+3. hands the leaf mirror record **together with all per-snapshot records**
    to `post_mirror` as a single list, then removes the mapping table entry.
 
 ```ocaml
 let snapshot_relations = get_snapshot_relations mirror_id in
-call_set_snapshot_relations ~dest_sr ~leaf_vdi:remote_vdi snapshot_relations ;
 let snapshot_mirror_records =
   List.filter_map create_snapshot_mirror_record snapshot_relations
 in
@@ -561,6 +577,12 @@ let result = post_mirror mirror_id all_mirror_records in
 Option.iter Storage_migrate_helper.State.remove_snapshot_mappings mirror_id ;
 result
 ```
+
+Notice that there is no explicit "publish snapshot metadata" call here at
+all: the per-snapshot mirror records are enough to make the existing
+SMAPIv1-era `update_snapshot_info` step (already invoked once near the end
+of `migrate_send'` when `snapshots_map <> []`) do that work for us. SMAPIv3
+and SMAPIv1 now share that single code path.
 
 The other touch in `xapi_vm_migrate.ml` is a one-line filter inside
 `migrate_send'`. Historically the `extra_vdis` list bundled both suspend
@@ -591,7 +613,7 @@ policy: snapshot tree discovery failures log and return an empty list (the
 migration falls back to the leaf-only fast path); a snapshot mirror that
 fails during the DFS aborts the whole migration immediately, since a partial
 tree on the destination is worse than no tree; metadata-only failures
-(`SR.set_snapshot_relations`, `set_content_id`, `VDI.set_snapshot_metadata`)
+(`SR.update_snapshot_info_dest`, `set_content_id`, `VDI.set_snapshot_metadata`)
 are logged as warnings but do not abort, because the data is already on the
 destination and XAPI-level relations are usually sufficient. Cleanup paths
 (`prepare_branch_vdi`'s cleanup thunk, branch VDI teardown) are wrapped in
@@ -721,45 +743,47 @@ continues to operate on a flat `mirror_record list` covering every disk and
 every snapshot, so VBD remapping for both the leaf and the snapshot VMs
 continues to work without any further structural changes.
 
-### Propagating `content_id` from source snapshots to destination snapshots
+### Cross-pool migration fails with IMPORT_ERROR when snapshot host is unknown on destination
 
-After the multi-disk fix the migration reached
-`SR.update_snapshot_info_dest`, which then failed with
-`Content_ids_do_not_match` on every snapshot pair. The destination backend's
-`assert_content_ids_match` requires the destination snapshot's `content_id` to
-equal the source snapshot's `content_id`.
+Each snapshot record stores the host UUID where it was taken. During cross-pool migration, the destination pool has no knowledge of the source pool's hosts, so this host reference cannot be resolved and becomes Ref.null. The check_references function in import.ml then tried to validate this null reference and crashed with IMPORT_ERROR, failing the whole migration.
 
-Why this breaks for SMAPIv3 mirror but not for SMAPIv1 SXM:
-
-- SMAPIv1 SXM transfers the snapshot's `content_id` along with the snapshot
-  copy itself (see `storage_smapiv1_migrate.ml`, which calls
-  `Remote.VDI.set_content_id` right after the copy completes).
-- The new SMAPIv3 path mirrors raw block data over NBD and then calls
-  `Remote.VDI.snapshot` on the destination. The destination SR's
-  `VDI.snapshot` auto-generates a fresh `content_id`, which never matches the
-  source.
-
-Fix, mirroring the legacy SMAPIv1 pattern, lives entirely in
-`create_destination_snapshot` / `mirror_snapshot_into_existing_dest` in
-`storage_smapiv3_migrate.ml`:
-
-1. Before attaching the source snapshot for mirroring, capture its
-   `content_id` via `Local.VDI.stat`.
-2. After `Remote.VDI.snapshot` produces the destination snapshot, immediately
-   call `Remote.VDI.set_content_id` to overwrite the auto-generated value
-   with the captured source `content_id`.
+The fix is straightforward — skip the reference check when the reference is Ref.null:
 
 ```ocaml
-let create_destination_snapshot ~dbg ~dest_sr ~dest_url ~verify_dest
-    ~dest_vdi_info ~src_content_id =
-  let (module Remote) = get_remote_backend dest_url verify_dest in
-  let dest_snapshot =
-    Remote.VDI.snapshot dbg dest_sr
-      {dest_vdi_info with sm_config= [("snapshot_parent", "true")]}
-  in
-  Remote.VDI.set_content_id dbg dest_sr dest_snapshot.vdi src_content_id ;
-  {dest_snapshot with content_id= src_content_id}
+let rec go (clazz, _, r) =
+  if r = Ref.string_of Ref.null then
+    ()
+  else
+    match get_snapshot ~clazz ~r with
+    | Some record ->
+        Diagnostic.visit_references check_reference clazz record
+    | _ ->
+        debug "Could not find imported object %s" r
 ```
 
-`set_content_id` failures are logged as warnings rather than raised, so that
-exceptional cleanup paths are not masked by a metadata-only error.
+The host field in a snapshot is informational only and has no effect on the migrated VM, so skipping it is safe.
+
+### VDI type lost after snapshot revert on SMAPIv3 SR
+
+When reverting a snapshot, XAPI clones the snapshot disk via VDI.clone to create a new active VDI. The vdi_clone_impl in xapi-storage-script called Volume_client.clone but forgot to write the vdi-type key into the new volume's key store. vdi_create_impl does write this key, but vdi_clone_impl never did.
+
+After the revert, the next SR.scan reads back the volume metadata and gets ty = "" for the new active VDI because the key is missing. This empty type ends up in the XAPI database and breaks any logic that checks VDI type, including the snapshot migration flow.
+
+The fix adds the missing update_keys step to vdi_clone_impl, the same way vdi_create_impl does it:
+
+```ocaml
+let vdi_clone_impl dbg sr vdi_info =
+  Attached_SRs.find sr
+  >>>= (fun sr ->
+  clone ~dbg ~sr
+    ~vdi:(Storage_interface.Vdi.string_of vdi_info.Storage_interface.vdi)
+  >>>= update_keys ~dbg ~sr ~key:_vdi_type_key
+         ~value:(match vdi_info.Storage_interface.ty with "" -> None | s -> Some s)
+  >>>= fun response -> return (vdi_of_volume response)
+  )
+  |> wrap
+```
+
+Error Handling
+
+Snapshot discovery failures should log but return an empty list, Raise a exception and revert the migration. If a snapshot mirror fails, stop immediately with a clear error - we don't want partial snapshot migration. Metadata restoration failures get logged as warnings but don't block the migration, since the data is already copied. VBD updates are best-effort per snapshot. Cleanup operations use try-catch and never raise errors.
