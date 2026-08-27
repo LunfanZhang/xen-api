@@ -1398,6 +1398,9 @@ let migrate_send' ~__context ~vm ~dest ~live:_ ~vdi_map ~vdi_format_map ~vif_map
   let snapshots_vdis =
     List.filter_map (vdi_filter __context false) snapshots_vbds
   in
+  Storage_smapiv3_migrate.assert_migratable ~__context ~vm_uuid
+    ~active_vdis:(List.map (fun v -> v.vdi) vms_vdis)
+    ~snapshot_vdis:(List.map (fun v -> v.vdi) snapshots_vdis) ;
   let suspends_vdis =
     List.fold_left
       (fun acc vm_or_snapshot ->

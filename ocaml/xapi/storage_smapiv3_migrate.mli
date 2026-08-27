@@ -15,3 +15,12 @@
 module type SMAPIv2_MIRROR = Storage_interface.MIRROR
 
 module MIRROR : SMAPIv2_MIRROR
+
+val assert_migratable :
+     __context:Context.t
+  -> vm_uuid:string
+  -> active_vdis:[`VDI] API.Ref.t list
+  -> snapshot_vdis:[`VDI] API.Ref.t list
+  -> unit
+(** Rejects snapshot layouts the destination cannot reconstruct: hidden
+    [VDI.snapshots] and orphan snapshot VDIs. *)
